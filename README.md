@@ -116,6 +116,15 @@ Les personas utilisent automatiquement les outils MCP disponibles :
 - **Playwright** : Tests E2E cross-browser
 - **Chrome DevTools** : Debug performance, DOM, Network
 
+## Credits
+
+Ce projet s'inspire de plusieurs approches excellentes :
+
+- **[SuperClaude](https://github.com/NomenAK/SuperClaude)** - Personas experts, mode token-efficient, approche evidence-based
+- **[Ralph](https://github.com/rvanmarkus/ralph)** - Détection intelligente de fin de tâche, rate limiting, fichiers de contrôle `@`
+
+Merci à ces projets pour leurs idées et patterns !
+
 ## Licence
 
 MIT
