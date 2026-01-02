@@ -9,6 +9,8 @@
 # - Ralph (détection fin de tâche, rate limiting, fichiers de contrôle)
 # =============================================================================
 
+VERSION="1.0.0"
+
 set -uo pipefail
 # Note: -e removed to allow better error handling in parallel mode
 
@@ -298,6 +300,44 @@ RÈGLES ABSOLUES:
 - [HIGH] $ARCHITECTURE_FILE à jour avec les choix
 - [HIGH] Supprimer $CURRENT_TASK_FILE à la fin"
 
+PERSONA_MERGER="Tu es un GIT MERGE EXPERT avec 15 ans d'expérience en gestion de conflits.
+${MCP_TOOLS}
+${NO_QUESTIONS}
+
+UTILISE Sequential-thinking POUR:
+- Analyser chaque conflit étape par étape
+- Comprendre l'intention de chaque branche
+- Planifier la résolution optimale
+
+EXPERTISE:
+- Résolution de conflits Git complexes
+- Compréhension du contexte métier des changements
+- Préservation de l'intégrité du code
+- Merge de branches parallèles
+
+TA MISSION:
+1. Analyse les fichiers en conflit fournis
+2. Comprends l'intention de CHAQUE branche:
+   - Que voulait faire la branche A ?
+   - Que voulait faire la branche B ?
+3. Résous le conflit en:
+   - Préservant les deux fonctionnalités si compatibles
+   - Choisissant la meilleure implémentation si incompatibles
+   - Combinant intelligemment si possible
+4. AGIS: Fournis le code résolu SANS marqueurs de conflit
+
+FORMAT DE RÉPONSE:
+\`\`\`resolved
+[Le code résolu, propre, sans marqueurs <<<<< ===== >>>>>]
+\`\`\`
+
+RÈGLES ABSOLUES:
+- [CRITICAL] Jamais de marqueurs de conflit dans le résultat
+- [CRITICAL] Le code doit compiler/fonctionner
+- [CRITICAL] Préserver les tests des deux côtés
+- [HIGH] Garder le meilleur des deux implémentations
+- [HIGH] Documenter brièvement le choix si significatif"
+
 # -----------------------------------------------------------------------------
 # MODE TOKEN-EFFICIENT (Style SuperClaude)
 # -----------------------------------------------------------------------------
@@ -504,6 +544,20 @@ detect_no_changes() {
         log_info "Pas de changements détectés ($CONSECUTIVE_NO_CHANGES/$MAX_CONSECUTIVE_NO_CHANGES)"
         
         if [ $CONSECUTIVE_NO_CHANGES -ge $MAX_CONSECUTIVE_NO_CHANGES ]; then
+            # Vérifier s'il reste des tâches pendantes avant d'arrêter
+            local pending_tasks=0
+            if [ -f "$TASK_FILE" ]; then
+                pending_tasks=$(grep -c "^[[:space:]]*- \[ \]" "$TASK_FILE" 2>/dev/null || echo "0")
+            fi
+
+            if [ "$pending_tasks" -gt 0 ]; then
+                log_info "Pas de changements mais $pending_tasks tâche(s) restante(s) - on continue"
+                echo -e "${YELLOW}⚠️  $MAX_CONSECUTIVE_NO_CHANGES cycles sans changements mais $pending_tasks tâche(s) restante(s)${RESET}"
+                # Reset le compteur pour donner une autre chance
+                CONSECUTIVE_NO_CHANGES=0
+                return 1
+            fi
+
             echo -e "${YELLOW}⚠️  $MAX_CONSECUTIVE_NO_CHANGES cycles sans changements - arrêt intelligent${RESET}"
             log_info "Arrêt intelligent: pas de changements"
             return 0
@@ -1148,43 +1202,209 @@ merge_worktree() {
     fi
 }
 
-# Résoudre les conflits avec Claude
+# Résoudre UN fichier en conflit avec Claude AI
+resolve_single_conflict_with_ai() {
+    local file_path="$1"
+    local branch_name="$2"
+
+    log_info "🤖 Agent Merger: résolution de $file_path..."
+
+    # Récupérer le contenu en conflit
+    local conflict_content
+    conflict_content=$(cat "$file_path" 2>/dev/null)
+
+    if [ -z "$conflict_content" ]; then
+        log_error "Fichier vide ou inaccessible: $file_path"
+        return 1
+    fi
+
+    # Vérifier qu'il y a bien des marqueurs de conflit
+    if ! echo "$conflict_content" | grep -q "^<<<<<<<"; then
+        log_info "Pas de marqueurs de conflit dans $file_path"
+        return 0
+    fi
+
+    # Construire le prompt pour le Merger
+    local merge_prompt
+    merge_prompt=$(build_prompt "$PERSONA_MERGER" "
+FICHIER EN CONFLIT: $file_path
+BRANCHE SOURCE: $branch_name
+BRANCHE CIBLE: main
+
+CONTENU AVEC CONFLITS:
+\`\`\`
+$conflict_content
+\`\`\`
+
+INSTRUCTIONS:
+1. Analyse les sections entre <<<<<<< et >>>>>>>
+2. Comprends ce que chaque version voulait accomplir
+3. Produis une version fusionnée qui:
+   - Préserve les fonctionnalités des DEUX côtés
+   - N'a AUCUN marqueur de conflit
+   - Compile et fonctionne correctement
+
+Réponds UNIQUEMENT avec le bloc:
+\`\`\`resolved
+[ton code résolu ici]
+\`\`\`")
+
+    # Appeler Claude pour résoudre
+    local tmp_response
+    tmp_response=$(mktemp)
+
+    check_rate_limit
+
+    echo -e "${CYAN}  📤 Appel Agent Merger...${RESET}"
+
+    local resolved_content
+    resolved_content=$(claude -p $CLAUDE_FLAGS --output-format text "$merge_prompt" 2>/dev/null)
+
+    # Extraire le contenu entre ```resolved et ```
+    local extracted_code
+    extracted_code=$(echo "$resolved_content" | sed -n '/^```resolved$/,/^```$/p' | sed '1d;$d')
+
+    if [ -z "$extracted_code" ]; then
+        # Essayer sans le mot "resolved"
+        extracted_code=$(echo "$resolved_content" | sed -n '/^```$/,/^```$/p' | sed '1d;$d')
+    fi
+
+    if [ -z "$extracted_code" ]; then
+        log_error "Agent Merger n'a pas fourni de code résolu valide"
+        echo "$resolved_content" >> "$LOG_FILE"
+        return 1
+    fi
+
+    # Vérifier qu'il n'y a plus de marqueurs de conflit
+    if echo "$extracted_code" | grep -q "^<<<<<<<\|^=======\|^>>>>>>>"; then
+        log_error "Le code résolu contient encore des marqueurs de conflit"
+        return 1
+    fi
+
+    # Écrire le fichier résolu
+    echo "$extracted_code" > "$file_path"
+
+    log_success "✅ Conflit résolu par IA: $file_path"
+    return 0
+}
+
+# Résoudre TOUS les conflits d'un merge/rebase avec Claude
+resolve_all_conflicts_with_ai() {
+    local branch_name="$1"
+    local conflicted_files
+
+    # Lister les fichiers en conflit
+    conflicted_files=$(git diff --name-only --diff-filter=U 2>/dev/null)
+
+    if [ -z "$conflicted_files" ]; then
+        log_info "Aucun fichier en conflit"
+        return 0
+    fi
+
+    local total_files
+    total_files=$(echo "$conflicted_files" | wc -l | tr -d ' ')
+    local resolved_count=0
+    local failed_count=0
+
+    log_info "🔀 Agent Merger: $total_files fichier(s) en conflit à résoudre"
+
+    echo "$conflicted_files" | while IFS= read -r file; do
+        if [ -n "$file" ]; then
+            if resolve_single_conflict_with_ai "$file" "$branch_name"; then
+                git add "$file"
+                ((resolved_count++))
+            else
+                ((failed_count++))
+            fi
+        fi
+    done
+
+    if [ "$failed_count" -gt 0 ]; then
+        log_error "Agent Merger: $failed_count fichier(s) non résolus"
+        return 1
+    fi
+
+    log_success "Agent Merger: tous les conflits résolus!"
+    return 0
+}
+
+# Résoudre les conflits avec Claude (version améliorée avec Agent Merger)
 resolve_conflicts() {
     local conflict_file="${WORKTREE_DIR}/.conflicts"
-    
+    local merging_file="${WORKTREE_DIR}/.merging"
+
     if [ ! -f "$conflict_file" ]; then
         return 0
     fi
-    
-    log_info "Résolution des conflits..."
-    
+
+    # Signaler que le merge est en cours (pour le dashboard)
+    touch "$merging_file"
+
+    log_info "🔀 Résolution des conflits avec Agent Merger..."
+
+    local remaining_conflicts=()
+
     while IFS= read -r agent_id; do
         local worktree_path="${WORKTREE_DIR}/agent-${agent_id}"
         local branch_name=$(cd "$worktree_path" 2>/dev/null && git branch --show-current)
-        
+
         if [ -z "$branch_name" ]; then
             continue
         fi
-        
-        log_info "Tentative de rebase pour agent-${agent_id}..."
-        
-        cd "$worktree_path" || continue
-        
-        # Rebase sur main
-        if git rebase main 2>/dev/null; then
-            log_success "Rebase réussi pour agent-${agent_id}"
-            
-            # Retour au repo principal pour merger
-            cd "$(git rev-parse --show-toplevel)" || continue
-            merge_worktree "$agent_id"
+
+        log_info "Agent $agent_id ($branch_name): tentative de résolution..."
+
+        # Revenir au repo principal
+        cd "$(git rev-parse --show-toplevel)" || continue
+
+        # Tenter le merge (qui va échouer avec des conflits)
+        if ! git merge "$branch_name" --no-edit 2>/dev/null; then
+            log_info "Conflits détectés, lancement de l'Agent Merger..."
+
+            # Utiliser l'Agent Merger pour résoudre
+            if resolve_all_conflicts_with_ai "$branch_name"; then
+                # Finaliser le merge
+                if git commit --no-edit -m "🤖 Auto-merge agent-${agent_id} (résolu par Agent Merger)"; then
+                    log_success "Agent $agent_id: Merge réussi (résolu par IA)"
+
+                    # Nettoyer le worktree
+                    git worktree remove "$worktree_path" --force 2>/dev/null || true
+                    git branch -d "$branch_name" 2>/dev/null || true
+                else
+                    log_error "Agent $agent_id: Échec du commit après résolution"
+                    git merge --abort 2>/dev/null
+                    remaining_conflicts+=("$agent_id")
+                fi
+            else
+                log_error "Agent $agent_id: Agent Merger n'a pas pu résoudre tous les conflits"
+                git merge --abort 2>/dev/null
+                remaining_conflicts+=("$agent_id")
+            fi
         else
-            git rebase --abort 2>/dev/null
-            log_error "Agent $agent_id: Conflit non résolu automatiquement"
-            log_info "  → Résolution manuelle requise dans: $worktree_path"
+            log_success "Agent $agent_id: Merge automatique réussi (pas de conflits)"
+            git worktree remove "$worktree_path" --force 2>/dev/null || true
+            git branch -d "$branch_name" 2>/dev/null || true
         fi
     done < "$conflict_file"
-    
+
     rm -f "$conflict_file"
+
+    # S'il reste des conflits non résolus
+    if [ ${#remaining_conflicts[@]} -gt 0 ]; then
+        log_error "Conflits non résolus pour: ${remaining_conflicts[*]}"
+        log_info "Résolution manuelle requise dans les worktrees correspondants"
+
+        # Réécrire les conflits restants
+        for agent_id in "${remaining_conflicts[@]}"; do
+            echo "$agent_id" >> "$conflict_file"
+        done
+        rm -f "$merging_file"
+        return 1
+    fi
+
+    rm -f "$merging_file"
+    log_success "🔀 Agent Merger: toutes les branches fusionnées avec succès!"
+    return 0
 }
 
 # Dashboard de monitoring des agents
@@ -1408,16 +1628,28 @@ while true; do
     
     echo -e "  ${GREEN}${bar}${RESET} ${pct}% (${done_count}/${total})"
     echo ""
-    
+
+    # Section Agent Merger
+    echo -e "${BOLD}🔀 Agent Merger:${RESET}"
+    if [ -f "${WORKTREE_DIR}/.conflicts" ]; then
+        conflict_count=$(wc -l < "${WORKTREE_DIR}/.conflicts" | tr -d ' ')
+        echo -e "  ${YELLOW}⚠️  ${conflict_count} conflit(s) en attente de résolution${RESET}"
+    elif [ -f "${WORKTREE_DIR}/.merging" ]; then
+        echo -e "  ${CYAN}🔄 Résolution en cours...${RESET}"
+    else
+        echo -e "  ${GREEN}✅ Aucun conflit${RESET}"
+    fi
+    echo ""
+
     echo -e "${GRAY}─────────────────────────────────────────────────────────────────${RESET}"
     echo -e "${GRAY}Refresh: 5s │ Ctrl+B puis n/p pour naviguer │ Ctrl+B d pour détacher${RESET}"
     echo -e "${GRAY}Heure: $(date '+%H:%M:%S')${RESET}"
-    
+
     # Vérifier si tous terminés
     if [ -n "$total" ] && [ "$total" -gt 0 ] && [ "$done_count" -eq "$total" ] 2>/dev/null; then
         echo ""
         echo -e "${GREEN}${BOLD}🎉 Tous les agents ont terminé !${RESET}"
-        echo -e "${CYAN}Les branches sont prêtes à être mergées.${RESET}"
+        echo -e "${CYAN}🔀 Lancement de l'Agent Merger pour fusionner les branches...${RESET}"
         break
     fi
     
@@ -1722,6 +1954,11 @@ while [[ $# -gt 0 ]]; do
             echo "  @fix_plan.md           Plan de correction prioritaire (optionnel)"
             echo "  @AGENT.md              Configuration agent (optionnel)"
             echo "  ARCHITECTURE.md        Documentation architecture"
+            echo ""
+            echo "Agent Merger (mode parallèle):"
+            echo "  Quand des conflits Git surviennent entre branches parallèles,"
+            echo "  l'Agent Merger utilise Claude pour résoudre intelligemment"
+            echo "  les conflits en préservant les fonctionnalités des deux côtés."
             echo ""
             echo "Exemples:"
             echo "  $0                     # Mode normal, 1 tâche à la fois"
