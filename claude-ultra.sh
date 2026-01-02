@@ -9,6 +9,8 @@
 # - Ralph (détection fin de tâche, rate limiting, fichiers de contrôle)
 # =============================================================================
 
+VERSION="1.0.0"
+
 set -uo pipefail
 # Note: -e removed to allow better error handling in parallel mode
 
@@ -904,6 +906,8 @@ Réponds UNIQUEMENT avec le message, rien d'autre."
         local commit_hash
         commit_hash=$(git rev-parse --short HEAD)
         echo -e "  ${GRAY}└─ Hash: ${commit_hash}${RESET}"
+        # Reset le compteur de "no changes" car un commit = du progrès
+        CONSECUTIVE_NO_CHANGES=0
     else
         log_error "Échec du commit"
         return 1
