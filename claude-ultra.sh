@@ -52,6 +52,7 @@ FAST_MODE="${FAST_MODE:-false}"
 # -----------------------------------------------------------------------------
 PARALLEL_MODE="${PARALLEL_MODE:-false}"
 PARALLEL_AGENTS="${PARALLEL_AGENTS:-3}"
+RESUME_MODE="${RESUME_MODE:-false}"
 WORKTREE_DIR=".worktrees"
 SWARM_SESSION="claude-swarm"
 AGENT_PIDS=()
@@ -1424,11 +1425,17 @@ echo "Git status: \$(git status --short 2>/dev/null | head -3)"
 # Lancer claude-ultra en mode single-task
 export PARALLEL_MODE=false
 export MAX_CONSECUTIVE_NO_CHANGES=2
+export FAST_MODE=${FAST_MODE:-false}
 
 # Exécuter le script principal (copié dans le worktree)
 if [ -f "./claude-ultra.sh" ]; then
-    echo "Lancement de claude-ultra.sh..."
-    ./claude-ultra.sh
+    if [ "\$FAST_MODE" = "true" ]; then
+        echo "Lancement de claude-ultra.sh en mode FAST..."
+        ./claude-ultra.sh --fast
+    else
+        echo "Lancement de claude-ultra.sh..."
+        ./claude-ultra.sh
+    fi
 else
     echo "claude-ultra.sh non trouvé, utilisation de Claude directement..."
     # Fallback: utiliser claude directement
@@ -1758,15 +1765,102 @@ draw_swarm_dashboard() {
     echo -e "${GRAY}Refresh: 10s | Ctrl+C pour arrêter${RESET}"
 }
 
+# Analyser les tâches pour détecter les conflits potentiels
+# Usage: analyze_task_conflicts "tâche1" "tâche2" "tâche3" ...
+analyze_task_conflicts() {
+    local task_list=("$@")
+    local num_tasks=${#task_list[@]}
+    local conflicts=()
+    local has_conflict=false
+
+    # Pattern pour détecter les fichiers mentionnés
+    local file_pattern='[a-zA-Z0-9_/-]+\.(ts|js|tsx|jsx|py|sh|go|rs|java|rb|vue|svelte|css|scss|html|md)'
+
+    for ((i=0; i<num_tasks; i++)); do
+        local task_i="${task_list[$i]}"
+        local task_i_lower=$(echo "$task_i" | tr '[:upper:]' '[:lower:]')
+
+        for ((j=i+1; j<num_tasks; j++)); do
+            local task_j="${task_list[$j]}"
+            local task_j_lower=$(echo "$task_j" | tr '[:upper:]' '[:lower:]')
+
+            # Extraire les fichiers/composants mentionnés
+            local files_i=$(echo "$task_i" | grep -oE "$file_pattern" 2>/dev/null | sort -u || true)
+            local files_j=$(echo "$task_j" | grep -oE "$file_pattern" 2>/dev/null | sort -u || true)
+
+            # Vérifier les fichiers communs
+            if [ -n "$files_i" ] && [ -n "$files_j" ]; then
+                local common_files=$(comm -12 <(echo "$files_i") <(echo "$files_j") 2>/dev/null || true)
+                if [ -n "$common_files" ]; then
+                    conflicts+=("Agents $i et $j: fichiers communs ($(echo "$common_files" | tr '\n' ' '))")
+                    has_conflict=true
+                    continue
+                fi
+            fi
+
+            # Vérifier les mots-clés similaires (composants, modules)
+            local words_i=$(echo "$task_i_lower" | grep -oE '\b[a-z]{4,}\b' 2>/dev/null | sort -u || true)
+            local words_j=$(echo "$task_j_lower" | grep -oE '\b[a-z]{4,}\b' 2>/dev/null | sort -u || true)
+
+            if [ -n "$words_i" ] && [ -n "$words_j" ]; then
+                local common_words=$(comm -12 <(echo "$words_i") <(echo "$words_j") 2>/dev/null | grep -v -E '^(pour|dans|avec|this|that|from|with|into|test|code|file|créer|fichier|avec|les)$' || true)
+
+                # Si beaucoup de mots en commun, potentiel conflit
+                local common_count=$(echo "$common_words" | grep -c . 2>/dev/null || echo 0)
+                if [ "$common_count" -ge 4 ]; then
+                    local sample_words=$(echo "$common_words" | head -3 | tr '\n' ', ')
+                    conflicts+=("Agents $i et $j: termes similaires (${sample_words%,})")
+                    has_conflict=true
+                fi
+            fi
+        done
+    done
+
+    # Afficher les avertissements
+    if [ "$has_conflict" = true ]; then
+        echo ""
+        echo -e "${YELLOW}⚠️  ATTENTION - Conflits potentiels détectés:${RESET}"
+        for conflict in "${conflicts[@]}"; do
+            echo -e "   ${YELLOW}• $conflict${RESET}"
+        done
+        echo ""
+        echo -e "${GRAY}Conseil: Assurez-vous que les tâches travaillent sur des fichiers différents${RESET}"
+        echo -e "${GRAY}pour minimiser les conflits de merge.${RESET}"
+        echo ""
+
+        # Demander confirmation
+        echo -e "${YELLOW}Continuer malgré les conflits potentiels? [O/n]${RESET}"
+        read -r -t 15 continue_anyway || continue_anyway="o"
+        if [[ ! "$continue_anyway" =~ ^[Oo]?$ ]]; then
+            log_info "Annulé par l'utilisateur (conflits potentiels)"
+            return 1
+        fi
+    else
+        echo -e "${GREEN}✓ Pas de conflit évident détecté entre les tâches${RESET}"
+    fi
+
+    return 0
+}
+
 # Boucle principale du mode parallèle
 run_parallel_mode() {
+    local mode_label="Mode Parallèle"
+    local mode_icon="🐝"
+    if [ "$FAST_MODE" = "true" ]; then
+        mode_label="Mode Parallèle + FAST ⚡"
+        mode_icon="🚀"
+    fi
+
     echo -e "${BOLD}${MAGENTA}"
     echo "╔══════════════════════════════════════════════════════════════════╗"
     echo "║                                                                  ║"
-    echo "║   🐝 CLAUDE SWARM - Mode Parallèle                               ║"
+    printf "║   %s CLAUDE SWARM - %-30s        ║\n" "$mode_icon" "$mode_label"
     echo "║                                                                  ║"
     echo "║   Agents: ${PARALLEL_AGENTS}                                                      ║"
     echo "║   Worktrees: ${WORKTREE_DIR}/                                          ║"
+    if [ "$FAST_MODE" = "true" ]; then
+    echo "║   Mode: FAST (1 appel unifié par agent)                         ║"
+    fi
     echo "║                                                                  ║"
     echo "╚══════════════════════════════════════════════════════════════════╝"
     echo -e "${RESET}"
@@ -1789,45 +1883,97 @@ run_parallel_mode() {
         log_error "Fichier $TASK_FILE introuvable"
         return 1
     fi
-    
-    # NETTOYER les anciens worktrees AVANT de commencer
-    log_info "Nettoyage des anciens worktrees..."
-    if [ -d "$WORKTREE_DIR" ]; then
-        for old_wt in "$WORKTREE_DIR"/agent-*; do
-            if [ -d "$old_wt" ]; then
-                log_info "  Suppression: $old_wt"
-                git worktree remove "$old_wt" --force 2>/dev/null || rm -rf "$old_wt"
+
+    # Variables pour le mode resume
+    local resume_agents=()
+    local is_resuming=false
+
+    # Mode RESUME : détecter les worktrees existants
+    if [ "$RESUME_MODE" = "true" ] && [ -d "$WORKTREE_DIR" ]; then
+        log_info "🔄 Mode RESUME - Détection des worktrees existants..."
+
+        local existing_count=0
+        local done_count=0
+        local to_resume_count=0
+
+        for wt in "$WORKTREE_DIR"/agent-*; do
+            if [ -d "$wt" ]; then
+                ((existing_count++))
+                local agent_id=$(basename "$wt" | sed 's/agent-//')
+
+                if [ -f "$wt/.agent-done" ]; then
+                    ((done_count++))
+                    log_info "  Agent $agent_id: ✅ Déjà terminé"
+                else
+                    ((to_resume_count++))
+                    resume_agents+=("$agent_id")
+                    log_info "  Agent $agent_id: ⏳ À reprendre"
+                fi
             fi
         done
-        rm -f "$WORKTREE_DIR"/.monitor.sh "$WORKTREE_DIR"/.conflicts 2>/dev/null
-    fi
-    git worktree prune 2>/dev/null || true
-    log_success "Nettoyage terminé"
-    
-    # Extraire les tâches
-    log_info "Extraction des tâches depuis $TASK_FILE..."
-    local tasks=()
-    while IFS= read -r task; do
-        if [ -n "$task" ]; then
-            tasks+=("$task")
-            log_info "  Tâche trouvée: ${task:0:50}..."
+
+        if [ $existing_count -gt 0 ]; then
+            is_resuming=true
+            PARALLEL_AGENTS=$existing_count
+            log_success "Trouvé $existing_count worktree(s): $done_count terminé(s), $to_resume_count à reprendre"
+
+            if [ $to_resume_count -eq 0 ]; then
+                log_success "Tous les agents ont terminé !"
+                log_info "Lancement du merge..."
+                # Passer directement au merge
+            fi
+        else
+            log_info "Aucun worktree trouvé, démarrage normal..."
+            RESUME_MODE="false"
         fi
-    done < <(extract_tasks "$PARALLEL_AGENTS")
-    
-    local num_tasks=${#tasks[@]}
-    
-    if [ "$num_tasks" -eq 0 ]; then
-        log_error "Aucune tâche trouvée dans $TASK_FILE"
-        log_info "Assure-toi d'avoir des lignes au format: - [ ] Ma tâche"
-        return 1
     fi
-    
-    log_success "Trouvé $num_tasks tâche(s) à paralléliser"
-    
-    # Ajuster le nombre d'agents si moins de tâches
-    if [ "$num_tasks" -lt "$PARALLEL_AGENTS" ]; then
-        PARALLEL_AGENTS=$num_tasks
-        log_info "Ajusté à $PARALLEL_AGENTS agent(s)"
+
+    # Mode NORMAL : nettoyer et créer
+    if [ "$is_resuming" = false ]; then
+        # NETTOYER les anciens worktrees AVANT de commencer
+        log_info "Nettoyage des anciens worktrees..."
+        if [ -d "$WORKTREE_DIR" ]; then
+            for old_wt in "$WORKTREE_DIR"/agent-*; do
+                if [ -d "$old_wt" ]; then
+                    log_info "  Suppression: $old_wt"
+                    git worktree remove "$old_wt" --force 2>/dev/null || rm -rf "$old_wt"
+                fi
+            done
+            rm -f "$WORKTREE_DIR"/.monitor.sh "$WORKTREE_DIR"/.conflicts 2>/dev/null
+        fi
+        git worktree prune 2>/dev/null || true
+        log_success "Nettoyage terminé"
+
+        # Extraire les tâches
+        log_info "Extraction des tâches depuis $TASK_FILE..."
+        local tasks=()
+        while IFS= read -r task; do
+            if [ -n "$task" ]; then
+                tasks+=("$task")
+                log_info "  Tâche trouvée: ${task:0:50}..."
+            fi
+        done < <(extract_tasks "$PARALLEL_AGENTS")
+
+        local num_tasks=${#tasks[@]}
+
+        if [ "$num_tasks" -eq 0 ]; then
+            log_error "Aucune tâche trouvée dans $TASK_FILE"
+            log_info "Assure-toi d'avoir des lignes au format: - [ ] Ma tâche"
+            return 1
+        fi
+
+        log_success "Trouvé $num_tasks tâche(s) à paralléliser"
+
+        # Analyser les conflits potentiels entre tâches
+        if ! analyze_task_conflicts "${tasks[@]}"; then
+            return 1
+        fi
+
+        # Ajuster le nombre d'agents si moins de tâches
+        if [ "$num_tasks" -lt "$PARALLEL_AGENTS" ]; then
+            PARALLEL_AGENTS=$num_tasks
+            log_info "Ajusté à $PARALLEL_AGENTS agent(s)"
+        fi
     fi
     
     # Sauvegarder le répertoire courant
@@ -1966,59 +2112,130 @@ MONITOR_EOF
     
     # Copier le script dans chaque worktree et lancer les agents
     local launched=0
-    for ((i=0; i<PARALLEL_AGENTS; i++)); do
-        local task="${tasks[$i]}"
-        log_info "Agent $i: ${task:0:50}..."
-        
-        # Créer le worktree
-        local worktree_path
-        worktree_path=$(create_worktree "$i" "$task")
-        
-        if [ -z "$worktree_path" ] || [ ! -d "$worktree_path" ]; then
-            log_error "Impossible de créer le worktree pour agent $i"
-            continue
-        fi
-        
-        log_success "Worktree agent-$i créé"
-        
-        # Créer le TODO spécifique
-        create_agent_todo "$worktree_path" "$task"
-        
-        # Copier le script principal
-        cp "$0" "${worktree_path}/claude-ultra.sh" 2>/dev/null || true
-        chmod +x "${worktree_path}/claude-ultra.sh" 2>/dev/null || true
-        
-        # Créer le script de l'agent
-        local agent_script
-        agent_script=$(launch_agent "$i" "$worktree_path" "$task")
-        
-        if [ ! -f "$agent_script" ]; then
-            log_error "Script agent non créé pour agent $i"
-            continue
-        fi
-        
-        # Créer une fenêtre tmux pour cet agent
-        log_info "Création fenêtre tmux agent-$i"
-        tmux new-window -t "$SWARM_SESSION" -n "agent-$i"
-        tmux send-keys -t "${SWARM_SESSION}:agent-$i" "bash '$agent_script'" Enter
-        
-        ((launched++))
-    done
-    
+    local agent_scripts=()
+
+    if [ "$is_resuming" = true ]; then
+        # MODE RESUME : relancer uniquement les agents non terminés
+        log_info "🔄 Reprise des agents interrompus..."
+
+        for agent_id in "${resume_agents[@]}"; do
+            local worktree_path="${WORKTREE_DIR}/agent-${agent_id}"
+
+            if [ ! -d "$worktree_path" ]; then
+                log_error "Worktree agent-$agent_id introuvable"
+                continue
+            fi
+
+            # Récupérer la tâche depuis @agent-task.md
+            local task=""
+            if [ -f "${worktree_path}/${AGENT_TASK_FILE}" ]; then
+                task=$(grep -E "^\s*- \[ \]" "${worktree_path}/${AGENT_TASK_FILE}" 2>/dev/null | head -1 | sed 's/^[[:space:]]*- \[ \][[:space:]]*//')
+            fi
+            log_info "Agent $agent_id: ${task:0:50}... (reprise)"
+
+            # Mettre à jour le script principal
+            cp "$0" "${worktree_path}/claude-ultra.sh" 2>/dev/null || true
+            chmod +x "${worktree_path}/claude-ultra.sh" 2>/dev/null || true
+
+            # Créer le script de l'agent
+            local agent_script
+            agent_script=$(launch_agent "$agent_id" "$worktree_path" "$task")
+
+            if [ ! -f "$agent_script" ]; then
+                log_error "Script agent non créé pour agent $agent_id"
+                continue
+            fi
+
+            agent_scripts+=("$agent_script")
+            ((launched++))
+        done
+    else
+        # MODE NORMAL : créer les worktrees et lancer les agents
+        for ((i=0; i<PARALLEL_AGENTS; i++)); do
+            local task="${tasks[$i]}"
+            log_info "Agent $i: ${task:0:50}..."
+
+            # Créer le worktree
+            local worktree_path
+            worktree_path=$(create_worktree "$i" "$task")
+
+            if [ -z "$worktree_path" ] || [ ! -d "$worktree_path" ]; then
+                log_error "Impossible de créer le worktree pour agent $i"
+                continue
+            fi
+
+            log_success "Worktree agent-$i créé"
+
+            # Créer le TODO spécifique
+            create_agent_todo "$worktree_path" "$task"
+
+            # Copier le script principal
+            cp "$0" "${worktree_path}/claude-ultra.sh" 2>/dev/null || true
+            chmod +x "${worktree_path}/claude-ultra.sh" 2>/dev/null || true
+
+            # Créer le script de l'agent
+            local agent_script
+            agent_script=$(launch_agent "$i" "$worktree_path" "$task")
+
+            if [ ! -f "$agent_script" ]; then
+                log_error "Script agent non créé pour agent $i"
+                continue
+            fi
+
+            # Stocker le script pour lancement ultérieur
+            agent_scripts+=("$agent_script")
+
+            ((launched++))
+        done
+    fi
+
     if [ $launched -eq 0 ]; then
         log_error "Aucun agent n'a pu être lancé"
         tmux kill-session -t "$SWARM_SESSION" 2>/dev/null
         return 1
     fi
-    
+
+    # Créer la fenêtre "all-agents" avec vue split
+    log_info "Création vue globale all-agents..."
+    tmux new-window -t "$SWARM_SESSION" -n "all-agents"
+
+    # Premier agent dans le pane principal
+    tmux send-keys -t "${SWARM_SESSION}:all-agents" "bash '${agent_scripts[0]}'" Enter
+
+    # Créer les panes pour les autres agents
+    for ((i=1; i<launched; i++)); do
+        if [ $((i % 2)) -eq 1 ]; then
+            # Split horizontal
+            tmux split-window -t "${SWARM_SESSION}:all-agents" -h
+        else
+            # Split vertical sur le dernier pane
+            tmux split-window -t "${SWARM_SESSION}:all-agents" -v
+        fi
+        tmux send-keys -t "${SWARM_SESSION}:all-agents" "bash '${agent_scripts[$i]}'" Enter
+    done
+
+    # Réorganiser en grille équilibrée
+    tmux select-layout -t "${SWARM_SESSION}:all-agents" tiled
+
+    # Créer aussi les fenêtres individuelles pour zoom
+    for ((i=0; i<launched; i++)); do
+        tmux new-window -t "$SWARM_SESSION" -n "agent-$i"
+        tmux send-keys -t "${SWARM_SESSION}:agent-$i" "bash '${agent_scripts[$i]}'" Enter
+    done
+
+    # Revenir sur la vue globale
+    tmux select-window -t "${SWARM_SESSION}:all-agents"
+
     log_success "Swarm lancé avec $launched agents"
     echo ""
     echo -e "${BOLD}${GREEN}Pour voir les agents:${RESET}"
     echo -e "  ${CYAN}tmux attach -t $SWARM_SESSION${RESET}"
     echo ""
     echo -e "${BOLD}Navigation tmux:${RESET}"
-    echo -e "  ${GRAY}Ctrl+B puis 0/1/2...  - Aller à une fenêtre${RESET}"
-    echo -e "  ${GRAY}Ctrl+B puis n         - Fenêtre suivante${RESET}"
+    echo -e "  ${GRAY}Fenêtre 1: all-agents  - Vue globale (tous les agents)${RESET}"
+    echo -e "  ${GRAY}Fenêtre 2+: agent-N    - Vue individuelle${RESET}"
+    echo -e "  ${GRAY}Ctrl+B puis 1/2/3...   - Changer de fenêtre${RESET}"
+    echo -e "  ${GRAY}Ctrl+B puis z          - Zoom/dézoom un pane${RESET}"
     echo -e "  ${GRAY}Ctrl+B puis d         - Détacher (agents continuent)${RESET}"
     echo ""
     
@@ -2228,6 +2445,10 @@ while [[ $# -gt 0 ]]; do
             PARALLEL_AGENTS="$2"
             shift 2
             ;;
+        --resume|-r)
+            RESUME_MODE="true"
+            shift
+            ;;
         --token-efficient)
             TOKEN_EFFICIENT_MODE="true"
             shift
@@ -2247,9 +2468,11 @@ while [[ $# -gt 0 ]]; do
             echo "  (default)              Mode séquentiel (1 agent, pipeline 8 étapes)"
             echo "  --fast, -f             Mode fast (1 appel = 1 tâche, ~7x plus rapide)"
             echo "  --parallel, -p         Mode parallèle (N agents sur N tâches)"
+            echo "  --parallel --fast      Mode parallèle + fast (N agents rapides)"
             echo ""
             echo "Options mode parallèle:"
             echo "  --agents N, -a N       Nombre d'agents parallèles (défaut: 3)"
+            echo "  --resume, -r           Reprendre les agents interrompus"
             echo ""
             echo "Options générales:"
             echo "  --token-efficient      Mode économie de tokens (réponses courtes)"
