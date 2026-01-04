@@ -44,6 +44,9 @@ CONSECUTIVE_NO_CHANGES=0
 # Mode token-efficient (style SuperClaude)
 TOKEN_EFFICIENT_MODE="${TOKEN_EFFICIENT_MODE:-false}"
 
+# Mode fast (1 appel Claude par cycle, style Ralph)
+FAST_MODE="${FAST_MODE:-false}"
+
 # -----------------------------------------------------------------------------
 # MODE PARALLÈLE (Git Worktrees)
 # -----------------------------------------------------------------------------
@@ -983,6 +986,273 @@ TASK_DOCUMENTER="MODE AUTONOME - AGIS MAINTENANT.
 3. Si choix d'architecture fait: mets à jour $ARCHITECTURE_FILE
 4. Supprime le fichier $CURRENT_TASK_FILE (rm $CURRENT_TASK_FILE)
 5. NE POSE PAS DE QUESTION - documente et nettoie"
+
+# -----------------------------------------------------------------------------
+# MODE FAST - Prompt unifié (1 appel = 1 tâche complète)
+# -----------------------------------------------------------------------------
+FAST_PROMPT="Tu es un DÉVELOPPEUR SENIOR AUTONOME avec expertise full-stack et DevOps.
+${MCP_TOOLS}
+${NO_QUESTIONS}
+
+MISSION: Implémente UNE SEULE tâche du projet en suivant ce workflow complet.
+
+WORKFLOW EN 6 ÉTAPES:
+
+1. SÉLECTION (PO)
+   - Lis $TASK_FILE et choisis UNE tâche non terminée (- [ ])
+   - Privilégie les quick wins à fort impact
+   - La tâche doit être faisable en <30 min
+
+2. IMPLÉMENTATION (TDD)
+   - Écris d'abord le test qui échoue (RED)
+   - Écris le code minimal pour passer (GREEN)
+   - Fonctions pures, early return, max 20 lignes/fonction
+   - Pas de commentaires, code auto-documenté
+
+3. QUALITÉ
+   - Lance les tests existants
+   - Vérifie les edge cases: null, undefined, empty, erreurs
+   - Ajoute les tests manquants
+
+4. SÉCURITÉ (OWASP Top 10)
+   - Jamais de secrets en dur
+   - Valider/sanitizer tous les inputs
+   - Escape output selon contexte
+
+5. DOCUMENTATION
+   - Marque la tâche terminée: - [x] tâche ($(date +%Y-%m-%d))
+   - Mets à jour $ARCHITECTURE_FILE si choix architectural
+
+6. COMMIT
+   - git add des fichiers modifiés
+   - Commit avec message conventionnel: type(scope): description
+
+RÈGLES ABSOLUES:
+- [CRITICAL] UNE SEULE tâche par exécution
+- [CRITICAL] AGIS directement, pas de questions
+- [CRITICAL] Si blocage, passe à une autre tâche
+- [HIGH] TDD strict: test first
+- [HIGH] Commit à la fin si changements"
+
+# Fonction pour construire le prompt fast avec contexte
+build_fast_prompt() {
+    local context=""
+    local fix_plan=""
+    local agent_config=""
+    local current_task=""
+
+    # Charger le contexte local
+    if [ -f "$CONTEXT_FILE" ]; then
+        context="
+CONTEXTE PROJET:
+$(cat "$CONTEXT_FILE")"
+    fi
+
+    # Charger le fix_plan prioritaire
+    if [ -f "$FIX_PLAN_FILE" ]; then
+        fix_plan="
+PLAN DE CORRECTION PRIORITAIRE (traite en premier!):
+$(cat "$FIX_PLAN_FILE")"
+    fi
+
+    # Charger la config agent
+    if [ -f "$AGENT_CONFIG_FILE" ]; then
+        agent_config="
+CONFIGURATION:
+$(cat "$AGENT_CONFIG_FILE")"
+    fi
+
+    # Charger la tâche en cours si elle existe
+    if [ -f "$CURRENT_TASK_FILE" ]; then
+        current_task="
+TÂCHE EN COURS (continue celle-ci!):
+$(cat "$CURRENT_TASK_FILE")"
+    fi
+
+    # Liste des tâches
+    local tasks=""
+    if [ -f "$TASK_FILE" ]; then
+        tasks="
+TÂCHES DISPONIBLES ($TASK_FILE):
+$(cat "$TASK_FILE")"
+    fi
+
+    echo "${FAST_PROMPT}
+${context}
+${fix_plan}
+${agent_config}
+${current_task}
+${tasks}
+
+${TOKEN_EFFICIENT_SUFFIX}
+
+AGIS MAINTENANT. Choisis une tâche et implémente-la complètement."
+}
+
+# -----------------------------------------------------------------------------
+# MODE FAST - Boucle principale
+# -----------------------------------------------------------------------------
+run_fast_mode() {
+    echo -e "${BOLD}${CYAN}"
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║                                                              ║"
+    echo "║   ⚡ MODE FAST - 1 appel = 1 tâche complète                  ║"
+    echo "║   Style Ralph: prompt unifié, détection fin intelligente    ║"
+    echo "║                                                              ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo -e "${RESET}"
+
+    draw_usage_dashboard
+
+    local loop=0
+    local tasks_completed=0
+    local start_time=$(date +%s)
+
+    while true; do
+        ((loop++))
+
+        # Vérifications avant cycle
+        if ! check_quota; then
+            echo -e "${RED}🛑 Quota critique - arrêt${RESET}"
+            break
+        fi
+
+        if check_task_completion; then
+            echo -e "${GREEN}🎉 Toutes les tâches terminées !${RESET}"
+            break
+        fi
+
+        if detect_no_changes; then
+            echo -e "${YELLOW}💤 Arrêt intelligent - pas de progrès${RESET}"
+            break
+        fi
+
+        # Rate limiting
+        check_rate_limit
+
+        # Header du loop
+        echo ""
+        echo -e "${BOLD}${MAGENTA}══════════════════════════════════════════════════════════${RESET}"
+        echo -e "${MAGENTA}⚡ FAST LOOP #${loop}${RESET} $(date '+%H:%M:%S')"
+        echo -e "${BOLD}${MAGENTA}══════════════════════════════════════════════════════════${RESET}"
+
+        log_info "Fast loop #$loop"
+        echo "--- FAST LOOP #$loop : $(date) ---" >> "$LOG_FILE"
+
+        # Construire le prompt
+        local full_prompt
+        full_prompt=$(build_fast_prompt)
+
+        # Exécuter Claude (UN SEUL appel)
+        echo -e "${CYAN}📤 Exécution Claude...${RESET}"
+        echo ""
+
+        local tmp_output
+        tmp_output=$(mktemp)
+        local exit_code=0
+
+        claude -p $CLAUDE_FLAGS --verbose --output-format stream-json "$full_prompt" 2>&1 | \
+        while IFS= read -r line; do
+            local msg_type
+            msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
+
+            case "$msg_type" in
+                "assistant")
+                    local content
+                    content=$(echo "$line" | jq -r '.message.content[]? | select(.type == "text") | .text // empty' 2>/dev/null)
+                    if [ -n "$content" ]; then
+                        echo "$content" | while IFS= read -r text_line; do
+                            echo -e "  │ $text_line"
+                            echo "$text_line" >> "$tmp_output"
+                        done
+                    fi
+                    ;;
+                "result")
+                    update_usage_from_result "$line"
+                    local is_error
+                    is_error=$(echo "$line" | jq -r '.is_error // false' 2>/dev/null)
+                    if [ "$is_error" = "true" ]; then
+                        exit_code=1
+                    fi
+                    ;;
+            esac
+        done
+
+        exit_code=${PIPESTATUS[0]:-$exit_code}
+
+        # Log output
+        if [ -f "$tmp_output" ]; then
+            echo "[FAST LOOP #$loop]" >> "$LOG_FILE"
+            cat "$tmp_output" >> "$LOG_FILE"
+            rm -f "$tmp_output"
+        fi
+
+        echo ""
+        echo -e "${GRAY}─────────────────────────────────────────────────────────${RESET}"
+
+        # Vérifier les changements et commit automatique
+        if ! git diff --quiet || ! git diff --cached --quiet; then
+            CONSECUTIVE_NO_CHANGES=0
+            ((tasks_completed++))
+
+            echo -e "${GREEN}✓ Changements détectés${RESET}"
+            git status --short | head -5 | while read -r line; do
+                echo -e "  ${GRAY}│${RESET} $line"
+            done
+
+            # Auto-commit
+            git add -A
+
+            local diff_summary
+            diff_summary=$(git diff --cached --stat | tail -3)
+
+            local commit_message
+            commit_message=$(claude -p $CLAUDE_FLAGS --output-format text "Message commit conventionnel (1 ligne, format type(scope): desc) pour:
+$diff_summary" 2>/dev/null | head -1 | tr -d '\n')
+
+            if [ -z "$commit_message" ]; then
+                commit_message="chore: fast-mode loop $loop"
+            fi
+
+            if git commit -m "$commit_message" >> "$LOG_FILE" 2>&1; then
+                local commit_hash=$(git rev-parse --short HEAD)
+                echo -e "${GREEN}📦 Commit:${RESET} $commit_message ${GRAY}($commit_hash)${RESET}"
+                log_success "Commit: $commit_message"
+            fi
+        else
+            echo -e "${YELLOW}ℹ Pas de changements ce loop${RESET}"
+        fi
+
+        # Stats
+        local elapsed=$(($(date +%s) - start_time))
+        local mins=$((elapsed / 60))
+        local secs=$((elapsed % 60))
+
+        echo ""
+        echo -e "${GRAY}📊 Loop $loop | Tâches: $tasks_completed | Temps: ${mins}m${secs}s | Quota: ${SESSION_QUOTA_PCT}%${RESET}"
+
+        # Pause courte
+        echo -e "${YELLOW}⏸${RESET}  Pause 2s... (Ctrl+C pour arrêter)"
+        sleep 2
+    done
+
+    # Résumé final
+    local total_time=$(($(date +%s) - start_time))
+    local total_mins=$((total_time / 60))
+    local total_secs=$((total_time % 60))
+
+    echo ""
+    echo -e "${BOLD}${GREEN}"
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║                    ⚡ FAST MODE TERMINÉ                      ║"
+    echo "╠══════════════════════════════════════════════════════════════╣"
+    printf "║   Loops: %-5d    Tâches complétées: %-5d                  ║\n" "$loop" "$tasks_completed"
+    printf "║   Temps total: %dm%02ds                                      ║\n" "$total_mins" "$total_secs"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo -e "${RESET}"
+
+    draw_usage_dashboard
+}
 
 # -----------------------------------------------------------------------------
 # MODE PARALLÈLE - FONCTIONS
@@ -1930,6 +2200,10 @@ while [[ $# -gt 0 ]]; do
             TOKEN_EFFICIENT_MODE="true"
             shift
             ;;
+        --fast|-f)
+            FAST_MODE="true"
+            shift
+            ;;
         --max-calls)
             MAX_CALLS_PER_HOUR="$2"
             shift 2
@@ -1938,7 +2212,8 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [options]"
             echo ""
             echo "Modes:"
-            echo "  (default)              Mode séquentiel (1 agent, pipeline complet)"
+            echo "  (default)              Mode séquentiel (1 agent, pipeline 8 étapes)"
+            echo "  --fast, -f             Mode fast (1 appel = 1 tâche, ~7x plus rapide)"
             echo "  --parallel, -p         Mode parallèle (N agents sur N tâches)"
             echo ""
             echo "Options mode parallèle:"
@@ -1961,10 +2236,11 @@ while [[ $# -gt 0 ]]; do
             echo "  les conflits en préservant les fonctionnalités des deux côtés."
             echo ""
             echo "Exemples:"
-            echo "  $0                     # Mode normal, 1 tâche à la fois"
+            echo "  $0                     # Mode normal, pipeline 8 étapes"
+            echo "  $0 --fast              # Mode rapide, 1 appel/tâche (~7x plus rapide)"
             echo "  $0 --parallel          # 3 agents parallèles sur 3 tâches"
             echo "  $0 -p -a 5             # 5 agents parallèles sur 5 tâches"
-            echo "  $0 -p --token-efficient # Parallèle + économie tokens"
+            echo "  $0 -f --token-efficient # Fast + économie tokens"
             exit 0
             ;;
         *)
@@ -1997,6 +2273,9 @@ trap cleanup SIGINT SIGTERM
 # -----------------------------------------------------------------------------
 if [ "$PARALLEL_MODE" = "true" ]; then
     run_parallel_mode
+elif [ "$FAST_MODE" = "true" ]; then
+    init
+    run_fast_mode
 else
     main
 fi
