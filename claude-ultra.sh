@@ -1139,6 +1139,10 @@ run_fast_mode() {
         log_info "Fast loop #$loop"
         echo "--- FAST LOOP #$loop : $(date) ---" >> "$LOG_FILE"
 
+        # Capturer le HEAD avant exécution pour détecter les commits faits par Claude
+        local head_before
+        head_before=$(git rev-parse HEAD 2>/dev/null || echo "")
+
         # Construire le prompt
         local full_prompt
         full_prompt=$(build_fast_prompt)
@@ -1190,34 +1194,62 @@ run_fast_mode() {
         echo ""
         echo -e "${GRAY}─────────────────────────────────────────────────────────${RESET}"
 
-        # Vérifier les changements et commit automatique
+        # Vérifier les changements: fichiers modifiés OU commits faits par Claude
+        local head_after
+        head_after=$(git rev-parse HEAD 2>/dev/null || echo "")
+        local has_uncommitted_changes=false
+        local has_new_commits=false
+
+        # Vérifier les fichiers modifiés non commités
         if ! git diff --quiet || ! git diff --cached --quiet; then
+            has_uncommitted_changes=true
+        fi
+
+        # Vérifier si Claude a fait des commits
+        if [ -n "$head_before" ] && [ "$head_before" != "$head_after" ]; then
+            has_new_commits=true
+        fi
+
+        if [ "$has_uncommitted_changes" = true ] || [ "$has_new_commits" = true ]; then
             CONSECUTIVE_NO_CHANGES=0
             ((tasks_completed++))
 
-            echo -e "${GREEN}✓ Changements détectés${RESET}"
-            git status --short | head -5 | while read -r line; do
-                echo -e "  ${GRAY}│${RESET} $line"
-            done
-
-            # Auto-commit
-            git add -A
-
-            local diff_summary
-            diff_summary=$(git diff --cached --stat | tail -3)
-
-            local commit_message
-            commit_message=$(claude -p $CLAUDE_FLAGS --output-format text "Message commit conventionnel (1 ligne, format type(scope): desc) pour:
-$diff_summary" 2>/dev/null | head -1 | tr -d '\n')
-
-            if [ -z "$commit_message" ]; then
-                commit_message="chore: fast-mode loop $loop"
+            if [ "$has_new_commits" = true ]; then
+                local commit_count
+                commit_count=$(git rev-list --count "$head_before".."$head_after" 2>/dev/null || echo "1")
+                echo -e "${GREEN}✓ Changements détectés (${commit_count} commit(s) par Claude)${RESET}"
+                git log --oneline "$head_before".."$head_after" 2>/dev/null | while read -r line; do
+                    echo -e "  ${GRAY}│${RESET} $line"
+                done
+            else
+                echo -e "${GREEN}✓ Changements détectés${RESET}"
+                git status --short | head -5 | while read -r line; do
+                    echo -e "  ${GRAY}│${RESET} $line"
+                done
             fi
 
-            if git commit -m "$commit_message" >> "$LOG_FILE" 2>&1; then
-                local commit_hash=$(git rev-parse --short HEAD)
-                echo -e "${GREEN}📦 Commit:${RESET} $commit_message ${GRAY}($commit_hash)${RESET}"
-                log_success "Commit: $commit_message"
+            # Auto-commit des changements non commités restants
+            if [ "$has_uncommitted_changes" = true ]; then
+                git add -A
+
+                local diff_summary
+                diff_summary=$(git diff --cached --stat | tail -3)
+
+                if [ -n "$diff_summary" ]; then
+                    local commit_message
+                    commit_message=$(claude -p $CLAUDE_FLAGS --output-format text "Message commit conventionnel (1 ligne, format type(scope): desc) pour:
+$diff_summary" 2>/dev/null | head -1 | tr -d '\n')
+
+                    if [ -z "$commit_message" ]; then
+                        commit_message="chore: fast-mode loop $loop"
+                    fi
+
+                    if git commit -m "$commit_message" >> "$LOG_FILE" 2>&1; then
+                        local commit_hash=$(git rev-parse --short HEAD)
+                        echo -e "${GREEN}📦 Commit:${RESET} $commit_message ${GRAY}($commit_hash)${RESET}"
+                        log_success "Commit: $commit_message"
+                    fi
+                fi
             fi
         else
             echo -e "${YELLOW}ℹ Pas de changements ce loop${RESET}"
