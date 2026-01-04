@@ -1905,42 +1905,93 @@ run_parallel_mode() {
     local resume_agents=()
     local is_resuming=false
 
-    # Mode RESUME : détecter les worktrees existants
-    if [ "$RESUME_MODE" = "true" ] && [ -d "$WORKTREE_DIR" ]; then
-        log_info "🔄 Mode RESUME - Détection des worktrees existants..."
+    # Mode RESUME : détecter et merger les branches/worktrees existants
+    if [ "$RESUME_MODE" = "true" ]; then
+        log_info "🔄 Mode RESUME - Détection des agents existants..."
 
         local existing_count=0
         local done_count=0
         local to_resume_count=0
+        local merged_count=0
 
-        for wt in "$WORKTREE_DIR"/agent-*; do
-            if [ -d "$wt" ]; then
-                ((existing_count++))
-                local agent_id=$(basename "$wt" | sed 's/agent-//')
+        # 1. D'abord, chercher les branches agent-* orphelines (sans worktree)
+        local orphan_branches=$(git branch --list 'agent-*/*' 2>/dev/null)
+        if [ -n "$orphan_branches" ]; then
+            log_info "Branches orphelines détectées, tentative de merge..."
+            while IFS= read -r branch; do
+                branch=$(echo "$branch" | sed 's/^[* ]*//')
+                [ -z "$branch" ] && continue
 
-                if [ -f "$wt/.agent-done" ]; then
-                    ((done_count++))
-                    log_info "  Agent $agent_id: ✅ Déjà terminé"
+                local commits=$(git log main.."$branch" --oneline 2>/dev/null | wc -l | tr -d ' ')
+                if [ "$commits" -gt 0 ]; then
+                    log_info "  $branch: $commits commit(s) à merger"
+                    if git merge "$branch" --no-edit -m "🔀 Resume merge: $branch" 2>/dev/null; then
+                        log_success "  ✅ $branch mergé"
+                        git branch -d "$branch" 2>/dev/null
+                        ((merged_count++))
+                    else
+                        log_error "  ❌ Conflit sur $branch - résolution manuelle requise"
+                        git merge --abort 2>/dev/null
+                    fi
                 else
-                    ((to_resume_count++))
-                    resume_agents+=("$agent_id")
-                    log_info "  Agent $agent_id: ⏳ À reprendre"
+                    log_info "  $branch: aucun commit, suppression..."
+                    git branch -d "$branch" 2>/dev/null || git branch -D "$branch" 2>/dev/null
                 fi
-            fi
-        done
+            done <<< "$orphan_branches"
+        fi
+
+        # 2. Ensuite, traiter les worktrees existants
+        if [ -d "$WORKTREE_DIR" ]; then
+            for wt in "$WORKTREE_DIR"/agent-*; do
+                if [ -d "$wt" ]; then
+                    ((existing_count++))
+                    local agent_id=$(basename "$wt" | sed 's/agent-//')
+
+                    if [ -f "$wt/.agent-done" ]; then
+                        ((done_count++))
+                        # Agent terminé, merger immédiatement
+                        if [ ! -f "$wt/.merged" ]; then
+                            log_info "  Agent $agent_id: ✅ Terminé, merge en cours..."
+                            if merge_worktree "$agent_id"; then
+                                ((merged_count++))
+                            fi
+                        else
+                            log_info "  Agent $agent_id: ✅ Déjà mergé"
+                        fi
+                    else
+                        ((to_resume_count++))
+                        resume_agents+=("$agent_id")
+                        log_info "  Agent $agent_id: ⏳ À reprendre"
+                    fi
+                fi
+            done
+        fi
+
+        # Résumé
+        if [ $merged_count -gt 0 ]; then
+            log_success "$merged_count branche(s) mergée(s) avec succès"
+        fi
 
         if [ $existing_count -gt 0 ]; then
             is_resuming=true
             PARALLEL_AGENTS=$existing_count
-            log_success "Trouvé $existing_count worktree(s): $done_count terminé(s), $to_resume_count à reprendre"
+            log_success "Worktrees: $done_count terminé(s), $to_resume_count à reprendre"
 
             if [ $to_resume_count -eq 0 ]; then
-                log_success "Tous les agents ont terminé !"
-                log_info "Lancement du merge..."
-                # Passer directement au merge
+                log_success "Tous les agents ont terminé et sont mergés !"
+                # Nettoyer les worktrees
+                log_info "Nettoyage des worktrees..."
+                for wt in "$WORKTREE_DIR"/agent-*; do
+                    [ -d "$wt" ] && git worktree remove "$wt" --force 2>/dev/null
+                done
+                rmdir "$WORKTREE_DIR" 2>/dev/null
+                return 0
             fi
+        elif [ $merged_count -gt 0 ]; then
+            log_success "Toutes les branches orphelines ont été mergées !"
+            return 0
         else
-            log_info "Aucun worktree trouvé, démarrage normal..."
+            log_info "Aucun agent à reprendre, démarrage normal..."
             RESUME_MODE="false"
         fi
     fi
