@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "description": "Configuration Safety Net - Règles personnalisées",
+  "rules": [
+    {
+      "name": "block-git-add-all",
+      "command": "git",
+      "subcommand": "add",
+      "block_args": ["-A", "--all"],
+      "reason": "Utiliser 'git add <fichiers-spécifiques>' pour plus de contrôle"
+    },
+    {
+      "name": "block-npm-install-global",
+      "command": "npm",
+      "subcommand": "install",
+      "block_args": ["-g", "--global"],
+      "reason": "Installation globale npm bloquée - utiliser npx ou installation locale"
+    },
+    {
+      "name": "block-docker-system-prune",
+      "command": "docker",
+      "subcommand": "system",
+      "block_args": ["prune"],
+      "reason": "docker system prune peut supprimer des données importantes"
+    }
+  ]
+}

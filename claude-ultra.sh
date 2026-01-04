@@ -45,6 +45,13 @@ CONSECUTIVE_NO_CHANGES=0
 TOKEN_EFFICIENT_MODE="${TOKEN_EFFICIENT_MODE:-false}"
 
 # -----------------------------------------------------------------------------
+# SAFETY NET - Protection commandes destructives
+# -----------------------------------------------------------------------------
+SAFETY_NET_ENABLED="${SAFETY_NET_ENABLED:-true}"
+SAFETY_NET_PARANOID="${SAFETY_NET_PARANOID:-false}"
+SAFETY_NET_SCRIPT="$(dirname "${BASH_SOURCE[0]}")/safety-net.sh"
+
+# -----------------------------------------------------------------------------
 # MODE PARALLÈLE (Git Worktrees)
 # -----------------------------------------------------------------------------
 PARALLEL_MODE="${PARALLEL_MODE:-false}"
@@ -491,6 +498,79 @@ log_error() {
 log_detail() {
     log "DETAIL" "$1"
     echo -e "${GRAY}[$(date '+%H:%M:%S')]     └─ $1${RESET}"
+}
+
+# -----------------------------------------------------------------------------
+# SAFETY NET - Vérification des commandes
+# -----------------------------------------------------------------------------
+safety_net_check() {
+    local cmd="$1"
+
+    # Skip si désactivé
+    if [ "$SAFETY_NET_ENABLED" != "true" ]; then
+        return 0
+    fi
+
+    # Vérifier que le script existe
+    if [ ! -f "$SAFETY_NET_SCRIPT" ]; then
+        log_info "Safety Net: script non trouvé, vérification ignorée"
+        return 0
+    fi
+
+    # Préparer les options
+    local opts=""
+    if [ "$SAFETY_NET_PARANOID" = "true" ]; then
+        opts="--paranoid"
+    fi
+
+    # Vérifier la commande
+    local result
+    result=$("$SAFETY_NET_SCRIPT" $opts --check "$cmd" 2>/dev/null)
+
+    local status
+    status=$(echo "$result" | jq -r '.status // "OK"' 2>/dev/null)
+
+    case "$status" in
+        "BLOCK")
+            local rule reason
+            rule=$(echo "$result" | jq -r '.rule // "unknown"' 2>/dev/null)
+            reason=$(echo "$result" | jq -r '.reason // "Commande bloquée"' 2>/dev/null)
+
+            echo -e "${RED}🛡️  SAFETY NET: Commande bloquée${RESET}"
+            echo -e "${RED}   Règle: $rule${RESET}"
+            echo -e "${RED}   Raison: $reason${RESET}"
+            log_error "Safety Net BLOCK: $cmd ($rule: $reason)"
+            return 1
+            ;;
+        "WARN")
+            local rule reason
+            rule=$(echo "$result" | jq -r '.rule // "unknown"' 2>/dev/null)
+            reason=$(echo "$result" | jq -r '.reason // "Attention requise"' 2>/dev/null)
+
+            echo -e "${YELLOW}⚠️  SAFETY NET: Avertissement${RESET}"
+            echo -e "${YELLOW}   Règle: $rule${RESET}"
+            echo -e "${YELLOW}   Raison: $reason${RESET}"
+            log_info "Safety Net WARN: $cmd ($rule: $reason)"
+            # Continue mais log l'avertissement
+            return 0
+            ;;
+        *)
+            # OK - commande autorisée
+            return 0
+            ;;
+    esac
+}
+
+# Wrapper pour exécuter une commande avec vérification Safety Net
+safe_exec() {
+    local cmd="$1"
+
+    if ! safety_net_check "$cmd"; then
+        return 1
+    fi
+
+    # Exécuter la commande
+    eval "$cmd"
 }
 
 # -----------------------------------------------------------------------------
@@ -1817,11 +1897,12 @@ main() {
     echo -e "${BOLD}${GREEN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║                                                              ║"
-    echo "║   🚀 DEV CYCLE ULTRA                                         ║"
+    echo "║   🚀 DEV CYCLE ULTRA v${VERSION}                                    ║"
     echo "║   Autonome + SuperClaude Personas + Ralph Intelligence       ║"
     echo "║                                                              ║"
     echo "║   Logs: $LOG_FILE"
     echo "║   Rate: ${MAX_CALLS_PER_HOUR}/h | Mode: $([ "$TOKEN_EFFICIENT_MODE" = "true" ] && echo "Efficient" || echo "Standard")"
+    echo "║   🛡️  Safety Net: $([ "$SAFETY_NET_ENABLED" = "true" ] && echo "Activé" || echo "Désactivé")$([ "$SAFETY_NET_PARANOID" = "true" ] && echo " (Paranoid)" || echo "")"
     echo "║                                                              ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${RESET}"
@@ -1934,6 +2015,30 @@ while [[ $# -gt 0 ]]; do
             MAX_CALLS_PER_HOUR="$2"
             shift 2
             ;;
+        --no-safety-net)
+            SAFETY_NET_ENABLED="false"
+            shift
+            ;;
+        --safety-paranoid)
+            SAFETY_NET_PARANOID="true"
+            shift
+            ;;
+        --safety-test)
+            if [ -f "$SAFETY_NET_SCRIPT" ]; then
+                "$SAFETY_NET_SCRIPT" --test
+            else
+                echo "Erreur: safety-net.sh non trouvé"
+            fi
+            exit 0
+            ;;
+        --safety-rules)
+            if [ -f "$SAFETY_NET_SCRIPT" ]; then
+                "$SAFETY_NET_SCRIPT" --list-rules
+            else
+                echo "Erreur: safety-net.sh non trouvé"
+            fi
+            exit 0
+            ;;
         --help|-h)
             echo "Usage: $0 [options]"
             echo ""
@@ -1949,6 +2054,12 @@ while [[ $# -gt 0 ]]; do
             echo "  --max-calls N          Limite d'appels par heure (défaut: 50)"
             echo "  --help, -h             Affiche cette aide"
             echo ""
+            echo "Options Safety Net:"
+            echo "  --no-safety-net        Désactive la protection (non recommandé)"
+            echo "  --safety-paranoid      Mode paranoid (bloque one-liners interpréteurs)"
+            echo "  --safety-test          Lance les tests du Safety Net"
+            echo "  --safety-rules         Affiche les règles actives"
+            echo ""
             echo "Fichiers de contrôle:"
             echo "  TODO.md                Tâches du projet (1 par ligne: - [ ] tâche)"
             echo "  @fix_plan.md           Plan de correction prioritaire (optionnel)"
@@ -1959,6 +2070,13 @@ while [[ $# -gt 0 ]]; do
             echo "  Quand des conflits Git surviennent entre branches parallèles,"
             echo "  l'Agent Merger utilise Claude pour résoudre intelligemment"
             echo "  les conflits en préservant les fonctionnalités des deux côtés."
+            echo ""
+            echo "Safety Net (protection):"
+            echo "  Bloque les commandes destructives AVANT leur exécution:"
+            echo "  - Git: reset --hard, push --force, checkout --, clean -f"
+            echo "  - Suppression: rm -rf /, rm -rf ~, rm -rf .git"
+            echo "  - Pipes: xargs rm, find -delete, parallel rm"
+            echo "  Configurable via .safety-net.json"
             echo ""
             echo "Exemples:"
             echo "  $0                     # Mode normal, 1 tâche à la fois"
