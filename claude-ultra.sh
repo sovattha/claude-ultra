@@ -1884,6 +1884,23 @@ run_parallel_mode() {
         return 1
     fi
 
+    # Protection contre les exécutions concurrentes
+    local lockfile="${WORKTREE_DIR}/.swarm.lock"
+    if [ -f "$lockfile" ]; then
+        local lock_pid=$(cat "$lockfile" 2>/dev/null)
+        if kill -0 "$lock_pid" 2>/dev/null; then
+            log_error "Une autre instance du swarm est en cours (PID: $lock_pid)"
+            log_info "Attendez qu'elle termine ou tuez-la: kill $lock_pid"
+            return 1
+        else
+            log_info "Nettoyage d'un ancien verrou orphelin..."
+            rm -f "$lockfile"
+        fi
+    fi
+    mkdir -p "$WORKTREE_DIR"
+    echo $$ > "$lockfile"
+    trap "rm -f '$lockfile'" EXIT
+
     # Variables pour le mode resume
     local resume_agents=()
     local is_resuming=false
@@ -2254,18 +2271,21 @@ MONITOR_EOF
     echo -e "${YELLOW}Surveillance des agents... (Ctrl+C pour arrêter)${RESET}"
     
     local all_done=false
+    local missing_worktrees=0
+
     while [ "$all_done" = false ]; do
         sleep 10
-        
+
         all_done=true
         local done_count=0
-        
+        missing_worktrees=0
+
         for ((i=0; i<launched; i++)); do
             local worktree_path="${WORKTREE_DIR}/agent-${i}"
-            
+
             if [ -f "${worktree_path}/.agent-done" ]; then
                 ((done_count++))
-                
+
                 # Merger si pas encore fait
                 if [ ! -f "${worktree_path}/.merged" ]; then
                     log_info "Agent $i terminé, tentative de merge..."
@@ -2274,13 +2294,22 @@ MONITOR_EOF
                         touch "${worktree_path}/.merged"
                     fi
                 fi
+            elif [ -d "$worktree_path" ]; then
+                # Worktree existe mais agent pas encore terminé
+                all_done=false
             else
-                if [ -d "$worktree_path" ]; then
-                    all_done=false
-                fi
+                # Worktree disparu sans .agent-done = problème!
+                ((missing_worktrees++))
             fi
         done
-        
+
+        if [ "$missing_worktrees" -gt 0 ] && [ "$done_count" -eq 0 ]; then
+            echo ""
+            log_error "$missing_worktrees worktree(s) ont disparu! Une autre exécution a peut-être nettoyé les worktrees."
+            log_error "Arrêt de la surveillance. Relancez le script pour recommencer."
+            break
+        fi
+
         echo -ne "\r${CYAN}Progress: $done_count/$launched agents terminés${RESET}    "
     done
     
