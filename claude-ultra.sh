@@ -48,6 +48,30 @@ TOKEN_EFFICIENT_MODE="${TOKEN_EFFICIENT_MODE:-false}"
 FAST_MODE="${FAST_MODE:-false}"
 
 # -----------------------------------------------------------------------------
+# AMÉLIORATIONS AUTONOMIE (Style Enterprise)
+# -----------------------------------------------------------------------------
+# Phase Specify: génère une spec automatique avant implémentation
+SPECIFY_MODE="${SPECIFY_MODE:-false}"
+SPEC_FILE="@spec.md"
+
+# Self-validation: l'agent vérifie sa propre sortie
+SELF_VALIDATE="${SELF_VALIDATE:-true}"
+
+# Rollback automatique: revert si tests échouent après N tentatives
+AUTO_ROLLBACK="${AUTO_ROLLBACK:-true}"
+MAX_TEST_RETRIES=2
+CURRENT_TEST_RETRIES=0
+
+# Rapport de fin: génère un résumé des décisions
+GENERATE_REPORT="${GENERATE_REPORT:-true}"
+REPORT_FILE="@session-report.md"
+
+# Tracking des décisions pour le rapport
+declare -a SESSION_DECISIONS=()
+declare -a SESSION_TASKS_COMPLETED=()
+declare -a SESSION_ROLLBACKS=()
+
+# -----------------------------------------------------------------------------
 # MODE PARALLÈLE (Git Worktrees)
 # -----------------------------------------------------------------------------
 PARALLEL_MODE="${PARALLEL_MODE:-false}"
@@ -1091,6 +1115,324 @@ AGIS MAINTENANT. Choisis une tâche et implémente-la complètement."
 }
 
 # -----------------------------------------------------------------------------
+# AMÉLIORATIONS AUTONOMIE - FONCTIONS
+# -----------------------------------------------------------------------------
+
+# Phase Specify: génère une spec automatique à partir de TODO.md
+generate_spec() {
+    if [ "$SPECIFY_MODE" != "true" ]; then
+        return 0
+    fi
+
+    # Skip si spec existe déjà et est récente (< 1 heure)
+    if [ -f "$SPEC_FILE" ]; then
+        local spec_age=$(($(date +%s) - $(stat -f %m "$SPEC_FILE" 2>/dev/null || stat -c %Y "$SPEC_FILE" 2>/dev/null || echo 0)))
+        if [ $spec_age -lt 3600 ]; then
+            log_info "Spec existante (< 1h), réutilisation"
+            return 0
+        fi
+    fi
+
+    echo -e "${CYAN}📋 Génération de la spécification...${RESET}"
+
+    local spec_prompt="Tu es un PRODUCT MANAGER Senior. Analyse le projet et génère une SPEC TECHNIQUE.
+
+FICHIERS À ANALYSER:
+- TODO.md: $(cat "$TASK_FILE" 2>/dev/null || echo "Vide")
+- ARCHITECTURE.md: $(head -50 "$ARCHITECTURE_FILE" 2>/dev/null || echo "Non trouvé")
+
+GÉNÈRE UNE SPEC AU FORMAT:
+
+# Spécification du Projet
+
+## Vue d'ensemble
+[Résumé du projet en 2-3 phrases]
+
+## Objectifs de la session
+[Liste des tâches à accomplir, par priorité]
+
+## Contraintes techniques
+[Stack, patterns, règles à respecter]
+
+## Critères de succès
+[Comment savoir si c'est terminé]
+
+## Risques identifiés
+[Potentiels blocages et mitigations]
+
+Écris UNIQUEMENT la spec, rien d'autre."
+
+    local spec_result
+    spec_result=$(claude -p $CLAUDE_FLAGS --output-format text "$spec_prompt" 2>/dev/null)
+
+    if [ -n "$spec_result" ]; then
+        echo "$spec_result" > "$SPEC_FILE"
+        echo -e "${GREEN}✓ Spec générée: $SPEC_FILE${RESET}"
+        track_decision "SPECIFY" "Spec générée automatiquement"
+        log_success "Spec générée: $SPEC_FILE"
+    else
+        log_error "Échec génération spec"
+    fi
+}
+
+# Self-validation: vérifie que la sortie est correcte
+self_validate() {
+    local task_description="$1"
+    local changes_summary="$2"
+
+    if [ "$SELF_VALIDATE" != "true" ]; then
+        return 0
+    fi
+
+    echo -e "${CYAN}🔍 Auto-validation...${RESET}"
+
+    local validate_prompt="Tu es un QA SENIOR. Vérifie si cette implémentation est correcte.
+
+TÂCHE DEMANDÉE:
+$task_description
+
+CHANGEMENTS EFFECTUÉS:
+$changes_summary
+
+FICHIERS MODIFIÉS:
+$(git diff --name-only HEAD~1 2>/dev/null | head -10)
+
+DIFF RÉSUMÉ:
+$(git diff --stat HEAD~1 2>/dev/null | tail -5)
+
+VÉRIFIE:
+1. La tâche est-elle complète?
+2. Y a-t-il des bugs évidents?
+3. Les tests passent-ils? (lance-les si nécessaire)
+4. Le code respecte-t-il les standards?
+
+RÉPONDS EN JSON:
+{
+  \"valid\": true/false,
+  \"issues\": [\"issue1\", \"issue2\"],
+  \"fixes_needed\": [\"fix1\", \"fix2\"],
+  \"confidence\": 0-100
+}
+
+Si valid=false et fixes_needed non vide, applique les corrections toi-même."
+
+    local validation_result
+    validation_result=$(claude -p $CLAUDE_FLAGS --output-format text "$validate_prompt" 2>/dev/null)
+
+    # Parser le résultat JSON
+    local is_valid
+    is_valid=$(echo "$validation_result" | jq -r '.valid // true' 2>/dev/null || echo "true")
+    local confidence
+    confidence=$(echo "$validation_result" | jq -r '.confidence // 80' 2>/dev/null || echo "80")
+
+    if [ "$is_valid" = "true" ]; then
+        echo -e "${GREEN}✓ Validation OK (confiance: ${confidence}%)${RESET}"
+        track_decision "VALIDATE" "Auto-validation réussie (${confidence}%)"
+        return 0
+    else
+        local issues
+        issues=$(echo "$validation_result" | jq -r '.issues[]?' 2>/dev/null | head -3)
+        echo -e "${YELLOW}⚠ Validation: issues détectées${RESET}"
+        echo "$issues" | while read -r issue; do
+            echo -e "  ${GRAY}└─ $issue${RESET}"
+        done
+        track_decision "VALIDATE" "Issues détectées: $issues"
+        return 1
+    fi
+}
+
+# Rollback automatique si tests échouent
+auto_rollback() {
+    local commit_to_revert="$1"
+
+    if [ "$AUTO_ROLLBACK" != "true" ]; then
+        return 0
+    fi
+
+    ((CURRENT_TEST_RETRIES++))
+
+    if [ $CURRENT_TEST_RETRIES -ge $MAX_TEST_RETRIES ]; then
+        echo -e "${RED}🔄 Rollback automatique après $MAX_TEST_RETRIES échecs${RESET}"
+
+        if [ -n "$commit_to_revert" ]; then
+            git revert --no-commit "$commit_to_revert" 2>/dev/null
+            git checkout HEAD -- . 2>/dev/null
+
+            local rollback_msg="Rollback: tests échoués après $MAX_TEST_RETRIES tentatives"
+            SESSION_ROLLBACKS+=("$(date '+%H:%M:%S') - $rollback_msg")
+            track_decision "ROLLBACK" "$rollback_msg"
+
+            echo -e "${YELLOW}↩ Revert effectué, passage à la tâche suivante${RESET}"
+            log_info "$rollback_msg"
+        fi
+
+        CURRENT_TEST_RETRIES=0
+        return 1
+    fi
+
+    echo -e "${YELLOW}⚠ Tentative $CURRENT_TEST_RETRIES/$MAX_TEST_RETRIES${RESET}"
+    return 0
+}
+
+# Exécuter les tests et gérer rollback
+run_tests_with_rollback() {
+    local commit_before="$1"
+
+    # Détecter le type de projet et lancer les tests appropriés
+    local test_cmd=""
+    local test_result=0
+
+    if [ -f "package.json" ]; then
+        if grep -q '"test"' package.json 2>/dev/null; then
+            test_cmd="npm test"
+        fi
+    elif [ -f "Cargo.toml" ]; then
+        test_cmd="cargo test"
+    elif [ -f "go.mod" ]; then
+        test_cmd="go test ./..."
+    elif [ -f "pytest.ini" ] || [ -f "setup.py" ] || [ -d "tests" ]; then
+        test_cmd="pytest -q"
+    elif [ -f "Makefile" ] && grep -q "^test:" Makefile 2>/dev/null; then
+        test_cmd="make test"
+    fi
+
+    if [ -z "$test_cmd" ]; then
+        # Pas de tests trouvés, considérer comme succès
+        CURRENT_TEST_RETRIES=0
+        return 0
+    fi
+
+    echo -e "${CYAN}🧪 Exécution des tests: $test_cmd${RESET}"
+
+    if eval "$test_cmd" >> "$LOG_FILE" 2>&1; then
+        echo -e "${GREEN}✓ Tests passés${RESET}"
+        CURRENT_TEST_RETRIES=0
+        track_decision "TESTS" "Tests passés: $test_cmd"
+        return 0
+    else
+        echo -e "${RED}✗ Tests échoués${RESET}"
+        track_decision "TESTS" "Tests échoués: $test_cmd"
+
+        if ! auto_rollback "$commit_before"; then
+            return 1
+        fi
+        return 2  # Retry possible
+    fi
+}
+
+# Tracker une décision pour le rapport
+track_decision() {
+    local category="$1"
+    local decision="$2"
+    local timestamp
+    timestamp=$(date '+%H:%M:%S')
+
+    SESSION_DECISIONS+=("[$timestamp] [$category] $decision")
+}
+
+# Générer le rapport de session
+generate_session_report() {
+    if [ "$GENERATE_REPORT" != "true" ]; then
+        return 0
+    fi
+
+    local end_time
+    end_time=$(date '+%Y-%m-%d %H:%M:%S')
+    local session_duration="$1"
+    local tasks_count="$2"
+    local loops_count="$3"
+
+    echo -e "${CYAN}📊 Génération du rapport de session...${RESET}"
+
+    cat > "$REPORT_FILE" << EOF
+# Rapport de Session Claude Ultra
+
+**Date:** $end_time
+**Durée:** ${session_duration}
+**Mode:** $([ "$FAST_MODE" = "true" ] && echo "Fast" || echo "Standard")
+
+## Résumé
+
+| Métrique | Valeur |
+|----------|--------|
+| Loops exécutés | $loops_count |
+| Tâches complétées | $tasks_count |
+| Quota utilisé | ${SESSION_QUOTA_PCT}% |
+| Tokens entrée | ${SESSION_INPUT_TOKENS} |
+| Tokens sortie | ${SESSION_OUTPUT_TOKENS} |
+
+## Décisions prises
+
+EOF
+
+    # Ajouter les décisions
+    if [ ${#SESSION_DECISIONS[@]} -gt 0 ]; then
+        for decision in "${SESSION_DECISIONS[@]}"; do
+            echo "- $decision" >> "$REPORT_FILE"
+        done
+    else
+        echo "_Aucune décision trackée_" >> "$REPORT_FILE"
+    fi
+
+    # Ajouter les tâches complétées
+    echo "" >> "$REPORT_FILE"
+    echo "## Tâches complétées" >> "$REPORT_FILE"
+    echo "" >> "$REPORT_FILE"
+
+    # Extraire les tâches marquées [x] dans TODO.md
+    if [ -f "$TASK_FILE" ]; then
+        grep -E "^\s*- \[x\]" "$TASK_FILE" 2>/dev/null | head -20 | while read -r line; do
+            echo "- $line" >> "$REPORT_FILE"
+        done
+    fi
+
+    # Ajouter les rollbacks si présents
+    if [ ${#SESSION_ROLLBACKS[@]} -gt 0 ]; then
+        echo "" >> "$REPORT_FILE"
+        echo "## Rollbacks effectués" >> "$REPORT_FILE"
+        echo "" >> "$REPORT_FILE"
+        for rollback in "${SESSION_ROLLBACKS[@]}"; do
+            echo "- ⚠️ $rollback" >> "$REPORT_FILE"
+        done
+    fi
+
+    # Ajouter les commits de la session
+    echo "" >> "$REPORT_FILE"
+    echo "## Commits de la session" >> "$REPORT_FILE"
+    echo "" >> "$REPORT_FILE"
+    echo '```' >> "$REPORT_FILE"
+    git log --oneline -20 --since="2 hours ago" 2>/dev/null >> "$REPORT_FILE" || echo "Aucun commit récent" >> "$REPORT_FILE"
+    echo '```' >> "$REPORT_FILE"
+
+    echo "" >> "$REPORT_FILE"
+    echo "---" >> "$REPORT_FILE"
+    echo "_Rapport généré automatiquement par Claude Ultra_" >> "$REPORT_FILE"
+
+    echo -e "${GREEN}✓ Rapport généré: $REPORT_FILE${RESET}"
+    log_success "Rapport de session: $REPORT_FILE"
+}
+
+# Prompt enrichi avec spec si disponible
+build_fast_prompt_with_spec() {
+    local base_prompt
+    base_prompt=$(build_fast_prompt)
+
+    # Ajouter la spec si disponible
+    if [ -f "$SPEC_FILE" ]; then
+        local spec_content
+        spec_content=$(cat "$SPEC_FILE")
+        echo "${base_prompt}
+
+SPÉCIFICATION DU PROJET (@spec.md):
+${spec_content}
+
+Respecte cette spec dans ton implémentation."
+    else
+        echo "$base_prompt"
+    fi
+}
+
+# -----------------------------------------------------------------------------
 # MODE FAST - Boucle principale
 # -----------------------------------------------------------------------------
 run_fast_mode() {
@@ -1100,10 +1442,19 @@ run_fast_mode() {
     echo "║   ⚡ MODE FAST - 1 appel = 1 tâche complète                  ║"
     echo "║   Style Ralph: prompt unifié, détection fin intelligente    ║"
     echo "║                                                              ║"
+    echo "╠══════════════════════════════════════════════════════════════╣"
+    printf "║   Specify: %-5s  Validate: %-5s  Rollback: %-5s  Report: %-5s║\n" \
+        "$([ "$SPECIFY_MODE" = "true" ] && echo "ON" || echo "OFF")" \
+        "$([ "$SELF_VALIDATE" = "true" ] && echo "ON" || echo "OFF")" \
+        "$([ "$AUTO_ROLLBACK" = "true" ] && echo "ON" || echo "OFF")" \
+        "$([ "$GENERATE_REPORT" = "true" ] && echo "ON" || echo "OFF")"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${RESET}"
 
     draw_usage_dashboard
+
+    # Phase Specify: générer spec automatique si activé
+    generate_spec
 
     local loop=0
     local tasks_completed=0
@@ -1144,9 +1495,9 @@ run_fast_mode() {
         local head_before
         head_before=$(git rev-parse HEAD 2>/dev/null || echo "")
 
-        # Construire le prompt
+        # Construire le prompt (avec spec si disponible)
         local full_prompt
-        full_prompt=$(build_fast_prompt)
+        full_prompt=$(build_fast_prompt_with_spec)
 
         # Exécuter Claude (UN SEUL appel)
         echo -e "${CYAN}📤 Exécution Claude...${RESET}"
@@ -1249,9 +1600,31 @@ $diff_summary" 2>/dev/null | head -1 | tr -d '\n')
                         local commit_hash=$(git rev-parse --short HEAD)
                         echo -e "${GREEN}📦 Commit:${RESET} $commit_message ${GRAY}($commit_hash)${RESET}"
                         log_success "Commit: $commit_message"
+                        track_decision "COMMIT" "$commit_message"
                     fi
                 fi
             fi
+
+            # Tests avec rollback automatique
+            local current_head
+            current_head=$(git rev-parse HEAD 2>/dev/null || echo "")
+            local test_result
+            run_tests_with_rollback "$head_before"
+            test_result=$?
+
+            if [ $test_result -eq 1 ]; then
+                # Rollback effectué, décrementer le compteur de tâches
+                ((tasks_completed--)) || true
+                continue
+            fi
+
+            # Self-validation (vérifie la qualité du travail)
+            local current_task_desc=""
+            if [ -f "$CURRENT_TASK_FILE" ]; then
+                current_task_desc=$(head -10 "$CURRENT_TASK_FILE")
+            fi
+            self_validate "$current_task_desc" "$diff_summary"
+
         else
             echo -e "${YELLOW}ℹ Pas de changements ce loop${RESET}"
         fi
@@ -1285,6 +1658,9 @@ $diff_summary" 2>/dev/null | head -1 | tr -d '\n')
     echo -e "${RESET}"
 
     draw_usage_dashboard
+
+    # Générer le rapport de session
+    generate_session_report "${total_mins}m${total_secs}s" "$tasks_completed" "$loop"
 }
 
 # -----------------------------------------------------------------------------
@@ -2537,6 +2913,30 @@ while [[ $# -gt 0 ]]; do
             FAST_MODE="true"
             shift
             ;;
+        --specify|-s)
+            SPECIFY_MODE="true"
+            shift
+            ;;
+        --no-validate)
+            SELF_VALIDATE="false"
+            shift
+            ;;
+        --no-rollback)
+            AUTO_ROLLBACK="false"
+            shift
+            ;;
+        --no-report)
+            GENERATE_REPORT="false"
+            shift
+            ;;
+        --enterprise|-e)
+            # Mode enterprise: active toutes les améliorations
+            SPECIFY_MODE="true"
+            SELF_VALIDATE="true"
+            AUTO_ROLLBACK="true"
+            GENERATE_REPORT="true"
+            shift
+            ;;
         --max-calls)
             MAX_CALLS_PER_HOUR="$2"
             shift 2
@@ -2559,11 +2959,22 @@ while [[ $# -gt 0 ]]; do
             echo "  --max-calls N          Limite d'appels par heure (défaut: 50)"
             echo "  --help, -h             Affiche cette aide"
             echo ""
+            echo "Options autonomie (Enterprise):"
+            echo "  --enterprise, -e       Active toutes les options ci-dessous"
+            echo "  --specify, -s          Génère une spec automatique avant exécution"
+            echo "  --no-validate          Désactive l'auto-validation après commit"
+            echo "  --no-rollback          Désactive le rollback auto si tests échouent"
+            echo "  --no-report            Désactive le rapport de session"
+            echo ""
             echo "Fichiers de contrôle:"
             echo "  TODO.md                Tâches du projet (1 par ligne: - [ ] tâche)"
             echo "  @fix_plan.md           Plan de correction prioritaire (optionnel)"
             echo "  @AGENT.md              Configuration agent (optionnel)"
             echo "  ARCHITECTURE.md        Documentation architecture"
+            echo ""
+            echo "Fichiers générés (mode Enterprise):"
+            echo "  @spec.md               Spécification générée automatiquement"
+            echo "  @session-report.md     Rapport de session avec décisions"
             echo ""
             echo "Agent Merger (mode parallèle):"
             echo "  Quand des conflits Git surviennent entre branches parallèles,"
@@ -2576,6 +2987,9 @@ while [[ $# -gt 0 ]]; do
             echo "  $0 --parallel          # 3 agents parallèles sur 3 tâches"
             echo "  $0 -p -a 5             # 5 agents parallèles sur 5 tâches"
             echo "  $0 -f --token-efficient # Fast + économie tokens"
+            echo "  $0 -f -e               # Fast + Enterprise (spec + validation + rollback + rapport)"
+            echo "  $0 -f --specify        # Fast avec génération de spec"
+            echo "  $0 -p -f -e            # Parallèle + Fast + Enterprise (autonomie maximale)"
             exit 0
             ;;
         *)
