@@ -998,7 +998,10 @@ TASK_QA="MODE AUTONOME - AGIS MAINTENANT.
 2. Lance les tests existants: npm test ou pytest
 3. Identifie les edge cases non testés (null, empty, erreurs)
 4. Écris les tests manquants
-5. NE POSE PAS DE QUESTION - teste et corrige"
+5. MOCK OBLIGATOIRE: tous les tests doivent fonctionner SANS connexion DB/réseau
+   - Mock Prisma, Supabase, fetch, et toute dépendance externe
+   - Utilise vi.mock(), jest.mock() ou équivalent
+6. NE POSE PAS DE QUESTION - teste et corrige"
 
 TASK_SECURITY="MODE AUTONOME - AGIS MAINTENANT.
 
@@ -1039,11 +1042,13 @@ WORKFLOW EN 6 ÉTAPES:
    - Écris le code minimal pour passer (GREEN)
    - Fonctions pures, early return, max 20 lignes/fonction
    - Pas de commentaires, code auto-documenté
+   - MOCK OBLIGATOIRE: mock toutes les connexions externes (DB, API, services)
 
 3. QUALITÉ
    - Lance les tests existants
    - Vérifie les edge cases: null, undefined, empty, erreurs
    - Ajoute les tests manquants
+   - Les tests doivent tourner SANS connexion DB/réseau (tout mocké)
 
 4. SÉCURITÉ (OWASP Top 10)
    - Jamais de secrets en dur
