@@ -62,6 +62,9 @@ AUTO_ROLLBACK="${AUTO_ROLLBACK:-true}"
 MAX_TEST_RETRIES=2
 CURRENT_TEST_RETRIES=0
 
+# Timeout pour l'exécution des tests (en secondes, 0 = pas de timeout)
+TEST_TIMEOUT="${TEST_TIMEOUT:-300}"  # 5 minutes par défaut
+
 # Rapport de fin: génère un résumé des décisions
 GENERATE_REPORT="${GENERATE_REPORT:-true}"
 REPORT_FILE="@session-report.md"
@@ -1284,7 +1287,8 @@ run_tests_with_rollback() {
 
     if [ -f "package.json" ]; then
         if grep -q '"test"' package.json 2>/dev/null; then
-            test_cmd="npm test"
+            # Forcer le mode non-interactif pour npm test
+            test_cmd="npm test -- --watchAll=false --ci 2>/dev/null || npm test"
         fi
     elif [ -f "Cargo.toml" ]; then
         test_cmd="cargo test"
@@ -1304,7 +1308,35 @@ run_tests_with_rollback() {
 
     echo -e "${CYAN}🧪 Exécution des tests: $test_cmd${RESET}"
 
-    if eval "$test_cmd" >> "$LOG_FILE" 2>&1; then
+    # Exécuter avec timeout si configuré
+    local exit_code=0
+    if [ "$TEST_TIMEOUT" -gt 0 ] 2>/dev/null; then
+        # Timeout cross-platform (macOS + Linux)
+        ( eval "$test_cmd" >> "$LOG_FILE" 2>&1 ) &
+        local test_pid=$!
+        local waited=0
+        while kill -0 $test_pid 2>/dev/null; do
+            if [ $waited -ge "$TEST_TIMEOUT" ]; then
+                kill -9 $test_pid 2>/dev/null
+                wait $test_pid 2>/dev/null
+                echo -e "${RED}✗ Tests timeout après ${TEST_TIMEOUT}s${RESET}"
+                track_decision "TESTS" "Tests timeout après ${TEST_TIMEOUT}s: $test_cmd"
+                if ! auto_rollback "$commit_before"; then
+                    return 1
+                fi
+                return 2
+            fi
+            sleep 1
+            ((waited++))
+        done
+        wait $test_pid
+        exit_code=$?
+    else
+        eval "$test_cmd" >> "$LOG_FILE" 2>&1
+        exit_code=$?
+    fi
+
+    if [ $exit_code -eq 0 ]; then
         echo -e "${GREEN}✓ Tests passés${RESET}"
         CURRENT_TEST_RETRIES=0
         track_decision "TESTS" "Tests passés: $test_cmd"
