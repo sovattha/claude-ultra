@@ -51,6 +51,23 @@ Claude Ultra is an autonomous CI/CD pipeline powered by Claude AI. It uses exper
 - Usage tracking via `update_usage_from_result()` parsing JSON responses
 - Worktrees created in `.worktrees/agent-N/` with branches like `agent-0/task-name`
 
+## Running Tests
+
+**IMPORTANT**: Always use non-interactive mode when running tests to avoid blocking:
+
+```bash
+# Vitest (preferred)
+npm test -- --run
+
+# Jest
+npm test -- --watchAll=false --ci
+
+# Generic fallback
+CI=true npm test
+```
+
+Never run `npm test` without flags - it will start in watch mode and block the pipeline.
+
 ## Git Commit Convention
 
 Use conventional commits: `type(scope): description`
