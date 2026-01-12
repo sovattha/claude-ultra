@@ -65,6 +65,9 @@ CURRENT_TEST_RETRIES=0
 # Timeout pour l'exécution des tests (en secondes, 0 = pas de timeout)
 TEST_TIMEOUT="${TEST_TIMEOUT:-300}"  # 5 minutes par défaut
 
+# Skip les tests (utile si les tests nécessitent une DB non disponible)
+SKIP_TESTS="${SKIP_TESTS:-false}"
+
 # Rapport de fin: génère un résumé des décisions
 GENERATE_REPORT="${GENERATE_REPORT:-true}"
 REPORT_FILE="@session-report.md"
@@ -1280,6 +1283,14 @@ auto_rollback() {
 # Exécuter les tests et gérer rollback
 run_tests_with_rollback() {
     local commit_before="$1"
+
+    # Option pour skip les tests complètement
+    if [ "$SKIP_TESTS" = "true" ]; then
+        echo -e "${YELLOW}⏭ Tests ignorés (SKIP_TESTS=true)${RESET}"
+        track_decision "TESTS" "Tests ignorés par configuration"
+        CURRENT_TEST_RETRIES=0
+        return 0
+    fi
 
     # Détecter le type de projet et lancer les tests appropriés
     local test_cmd=""
