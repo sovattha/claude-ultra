@@ -1289,6 +1289,10 @@ auto_rollback() {
 run_tests_with_rollback() {
     local commit_before="$1"
 
+    # DEBUG: Entrée dans la fonction
+    echo -e "${GRAY}[DEBUG] run_tests_with_rollback() appelée${RESET}"
+    echo "[DEBUG] run_tests_with_rollback() started at $(date)" >> "$LOG_FILE"
+
     # Option pour skip les tests complètement
     if [ "$SKIP_TESTS" = "true" ]; then
         echo -e "${YELLOW}⏭ Tests ignorés (SKIP_TESTS=true)${RESET}"
@@ -1300,41 +1304,75 @@ run_tests_with_rollback() {
     # Détecter le type de projet et lancer les tests appropriés
     local test_cmd=""
     local test_result=0
+    local test_framework=""
 
     if [ -f "package.json" ]; then
         if grep -q '"test"' package.json 2>/dev/null; then
-            # Forcer le mode non-interactif pour npm test
-            test_cmd="npm test -- --watchAll=false --ci 2>/dev/null || npm test"
+            # Détecter le framework de test (Vitest vs Jest vs autres)
+            if grep -qE '"vitest"|"@vitest"' package.json 2>/dev/null; then
+                test_framework="vitest"
+                # Vitest: utiliser --run pour mode non-interactif
+                test_cmd="npm test -- --run --reporter=basic"
+            elif grep -qE '"jest"|"@jest"' package.json 2>/dev/null; then
+                test_framework="jest"
+                # Jest: utiliser --watchAll=false et --ci
+                test_cmd="npm test -- --watchAll=false --ci --passWithNoTests"
+            else
+                test_framework="unknown"
+                # Fallback générique: essayer les deux syntaxes
+                test_cmd="npm test -- --run 2>/dev/null || npm test -- --watchAll=false --ci 2>/dev/null || CI=true npm test"
+            fi
+            echo -e "${GRAY}[DEBUG] Framework détecté: $test_framework${RESET}"
+            echo "[DEBUG] Test framework: $test_framework" >> "$LOG_FILE"
         fi
     elif [ -f "Cargo.toml" ]; then
         test_cmd="cargo test"
+        test_framework="cargo"
     elif [ -f "go.mod" ]; then
         test_cmd="go test ./..."
+        test_framework="go"
     elif [ -f "pytest.ini" ] || [ -f "setup.py" ] || [ -d "tests" ]; then
         test_cmd="pytest -q"
+        test_framework="pytest"
     elif [ -f "Makefile" ] && grep -q "^test:" Makefile 2>/dev/null; then
         test_cmd="make test"
+        test_framework="make"
     fi
 
     if [ -z "$test_cmd" ]; then
         # Pas de tests trouvés, considérer comme succès
+        echo -e "${GRAY}[DEBUG] Aucune commande de test trouvée, skip${RESET}"
         CURRENT_TEST_RETRIES=0
         return 0
     fi
 
     echo -e "${CYAN}🧪 Exécution des tests: $test_cmd${RESET}"
+    echo "[DEBUG] Running: $test_cmd" >> "$LOG_FILE"
 
     # Exécuter avec timeout si configuré
     local exit_code=0
     if [ "$TEST_TIMEOUT" -gt 0 ] 2>/dev/null; then
+        echo -e "${GRAY}[DEBUG] Timeout configuré: ${TEST_TIMEOUT}s${RESET}"
+
         # Timeout cross-platform (macOS + Linux)
-        ( eval "$test_cmd" >> "$LOG_FILE" 2>&1 ) &
+        # IMPORTANT: Fermer stdin avec < /dev/null pour éviter les blocages interactifs
+        ( eval "$test_cmd" < /dev/null >> "$LOG_FILE" 2>&1 ) &
         local test_pid=$!
         local waited=0
+
+        echo -e "${GRAY}[DEBUG] Test PID: $test_pid${RESET}"
+        echo "[DEBUG] Test PID: $test_pid" >> "$LOG_FILE"
+
         while kill -0 $test_pid 2>/dev/null; do
             if [ $waited -ge "$TEST_TIMEOUT" ]; then
-                kill -9 $test_pid 2>/dev/null
-                wait $test_pid 2>/dev/null
+                echo -e "${GRAY}[DEBUG] Timeout atteint, killing PID $test_pid${RESET}"
+                echo "[DEBUG] Timeout reached, killing PID $test_pid" >> "$LOG_FILE"
+
+                # Tuer le processus et tous ses enfants
+                pkill -P $test_pid 2>/dev/null || true
+                kill -9 $test_pid 2>/dev/null || true
+                wait $test_pid 2>/dev/null || true
+
                 echo -e "${RED}✗ Tests timeout après ${TEST_TIMEOUT}s${RESET}"
                 track_decision "TESTS" "Tests timeout après ${TEST_TIMEOUT}s: $test_cmd"
                 if ! auto_rollback "$commit_before"; then
@@ -1342,14 +1380,27 @@ run_tests_with_rollback() {
                 fi
                 return 2
             fi
+
+            # Afficher la progression toutes les 10 secondes
+            if [ $((waited % 10)) -eq 0 ] && [ $waited -gt 0 ]; then
+                echo -e "${GRAY}[DEBUG] Tests en cours... ${waited}s/${TEST_TIMEOUT}s${RESET}"
+            fi
+
             sleep 1
             ((waited++))
         done
+
         wait $test_pid
         exit_code=$?
+        echo -e "${GRAY}[DEBUG] Tests terminés en ${waited}s avec code: $exit_code${RESET}"
+        echo "[DEBUG] Tests finished in ${waited}s with exit code: $exit_code" >> "$LOG_FILE"
     else
-        eval "$test_cmd" >> "$LOG_FILE" 2>&1
+        echo -e "${GRAY}[DEBUG] Exécution sans timeout${RESET}"
+        # IMPORTANT: Fermer stdin avec < /dev/null pour éviter les blocages interactifs
+        eval "$test_cmd" < /dev/null >> "$LOG_FILE" 2>&1
         exit_code=$?
+        echo -e "${GRAY}[DEBUG] Tests terminés avec code: $exit_code${RESET}"
+        echo "[DEBUG] Tests finished with exit code: $exit_code" >> "$LOG_FILE"
     fi
 
     if [ $exit_code -eq 0 ]; then
@@ -1358,7 +1409,11 @@ run_tests_with_rollback() {
         track_decision "TESTS" "Tests passés: $test_cmd"
         return 0
     else
-        echo -e "${RED}✗ Tests échoués${RESET}"
+        echo -e "${RED}✗ Tests échoués (code: $exit_code)${RESET}"
+        # Afficher les dernières lignes du log pour debug
+        echo -e "${GRAY}[DEBUG] Dernières lignes du log:${RESET}"
+        tail -20 "$LOG_FILE" 2>/dev/null | head -10
+
         track_decision "TESTS" "Tests échoués: $test_cmd"
 
         if ! auto_rollback "$commit_before"; then
