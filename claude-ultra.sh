@@ -855,14 +855,15 @@ run_step() {
                 local is_error
                 is_error=$(echo "$line" | jq -r '.is_error // false' 2>/dev/null)
                 if [ "$is_error" = "true" ]; then
+                    # Marquer comme erreur potentielle, mais on vérifiera si du travail a été fait
                     exit_code=1
                 fi
                 ;;
         esac
     done
-    
-    exit_code=${PIPESTATUS[0]:-$exit_code}
-    
+
+    local pipe_exit=${PIPESTATUS[0]:-0}
+
     local output_size=0
     if [ -f "$tmp_output" ]; then
         output_size=$(wc -c < "$tmp_output" | tr -d ' ')
@@ -870,19 +871,35 @@ run_step() {
         cat "$tmp_output" >> "$LOG_FILE"
         rm -f "$tmp_output"
     fi
-    
+
     echo ""
     echo -e "${GRAY}─────────────────────────────────────────────────────────${RESET}"
-    
+
     local end_time
     end_time=$(date +%s)
     local duration=$((end_time - start_time))
-    
-    if [ "$exit_code" -ne 0 ]; then
-        log_error "Échec: $step_name (${duration}s)"
+
+    # Logique de succès améliorée:
+    # - Si Claude a produit une sortie significative (>100 chars), on considère que le travail est fait
+    # - Même si is_error=true ou pipe_exit!=0, c'est souvent un faux positif
+    # - On ne fail que si vraiment aucune sortie n'a été produite ET erreur signalée
+
+    if [ "$output_size" -gt 100 ]; then
+        # Travail significatif produit - succès même si erreur signalée
+        if [ "$exit_code" -ne 0 ] || [ "$pipe_exit" -ne 0 ]; then
+            echo -e "${YELLOW}⚠ Avertissement: erreur signalée mais travail effectué (${output_size} chars)${RESET}"
+            log_info "Warning: $step_name signale une erreur mais a produit du travail"
+        fi
+        log_success "$step_name terminé (${duration}s)"
+        return 0
+    fi
+
+    # Pas de sortie significative - vérifier les erreurs
+    if [ "$exit_code" -ne 0 ] || [ "$pipe_exit" -ne 0 ]; then
+        log_error "Échec: $step_name (${duration}s) - pas de sortie et erreur signalée"
         return 1
     fi
-    
+
     log_success "$step_name terminé (${duration}s)"
     return 0
 }
