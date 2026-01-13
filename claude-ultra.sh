@@ -41,6 +41,9 @@ HOUR_START=$(date +%s)
 MAX_CONSECUTIVE_NO_CHANGES=3
 CONSECUTIVE_NO_CHANGES=0
 
+# Mode persistent (ne s'arrête jamais automatiquement)
+PERSISTENT_MODE="${PERSISTENT_MODE:-false}"
+
 # Mode token-efficient (style SuperClaude)
 TOKEN_EFFICIENT_MODE="${TOKEN_EFFICIENT_MODE:-false}"
 
@@ -724,11 +727,16 @@ check_task_completion() {
 }
 
 detect_no_changes() {
+    # En mode persistent, ne jamais s'arrêter automatiquement
+    if [ "$PERSISTENT_MODE" = "true" ]; then
+        return 1
+    fi
+
     # Vérifie s'il y a eu des changements git
     if git diff --quiet && git diff --cached --quiet; then
         ((CONSECUTIVE_NO_CHANGES++))
         log_info "Pas de changements détectés ($CONSECUTIVE_NO_CHANGES/$MAX_CONSECUTIVE_NO_CHANGES)"
-        
+
         if [ $CONSECUTIVE_NO_CHANGES -ge $MAX_CONSECUTIVE_NO_CHANGES ]; then
             # Vérifier s'il reste des tâches pendantes avant d'arrêter
             local pending_tasks=0
@@ -3327,6 +3335,11 @@ while [[ $# -gt 0 ]]; do
             AUTO_ROLLBACK="false"
             shift
             ;;
+        --persistent|--no-stop)
+            PERSISTENT_MODE="true"
+            MAX_CONSECUTIVE_NO_CHANGES=9999
+            shift
+            ;;
         --no-report)
             GENERATE_REPORT="false"
             shift
@@ -3378,6 +3391,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --validate             Active l'auto-validation après commit (désactivé par défaut en --fast)"
             echo "  --no-validate          Désactive l'auto-validation après commit"
             echo "  --no-rollback          Désactive le rollback auto si tests échouent"
+            echo "  --persistent, --no-stop  Ne s'arrête jamais (ignore cycles sans changements)"
             echo "  --no-report            Désactive le rapport de session"
             echo ""
             echo "Fichiers de contrôle:"
