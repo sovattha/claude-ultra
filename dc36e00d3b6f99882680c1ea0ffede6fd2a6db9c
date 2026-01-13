@@ -1,0 +1,23 @@
+claude-ultra.sh
+  6af91977a20bf6de 50-62,593-681,958,961-967,970,973,1051,1058,1063,1721-1733,1761-1770,1774,1776,1781,1783,1788,1790,1797-1802,1888-1889,1959-1961,1967,1988-1991,3122-3135,3147,3149,3151,3153-3165,3168,3170-3171,3175,3177,3179-3180,3184,3186,3188-3189,3193-3200,3247-3254,3259,3262,3265,3300-3311,3360-3362,3365-3371,3405-3406
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.0.31",
+  "base_commit_sha": "dc36e00d3b6f99882680c1ea0ffede6fd2a6db9c",
+  "prompts": {
+    "6af91977a20bf6de": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ec96b182-2039-424a-a721-aacdb5a24584",
+        "model": "claude-opus-4-5-20251101"
+      },
+      "human_author": "Sovattha Sok <github@soks.fr>",
+      "messages": [],
+      "total_additions": 630,
+      "total_deletions": 14,
+      "accepted_lines": 630,
+      "overriden_lines": 0
+    }
+  }
+}
