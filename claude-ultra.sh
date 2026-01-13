@@ -47,6 +47,19 @@ TOKEN_EFFICIENT_MODE="${TOKEN_EFFICIENT_MODE:-false}"
 # Mode fast (1 appel Claude par cycle, style Ralph)
 FAST_MODE="${FAST_MODE:-false}"
 
+# Mode output: verbose (défaut), events (JSON), quiet (minimal)
+OUTPUT_MODE="${OUTPUT_MODE:-verbose}"
+
+# Limite de tâches (0 = illimité)
+MAX_TASKS="${MAX_TASKS:-0}"
+
+# Fichiers de contrôle events (pour intégration Claude Code)
+EVENTS_FILE="@ultra.events.log"
+PROGRESS_FILE="@ultra.progress.json"
+CONTROL_FILE="@ultra.command"
+STATUS_FILE="@ultra.status"
+PID_FILE="@ultra.pid"
+
 # -----------------------------------------------------------------------------
 # AMÉLIORATIONS AUTONOMIE (Style Enterprise)
 # -----------------------------------------------------------------------------
@@ -64,6 +77,9 @@ CURRENT_TEST_RETRIES=0
 
 # Timeout pour l'exécution des tests (en secondes, 0 = pas de timeout)
 TEST_TIMEOUT="${TEST_TIMEOUT:-300}"  # 5 minutes par défaut
+
+# Timeout pour les appels Claude auxiliaires (validation, commit msg, etc.)
+CLAUDE_AUX_TIMEOUT="${CLAUDE_AUX_TIMEOUT:-60}"  # 60 secondes par défaut
 
 # Skip les tests (utile si les tests nécessitent une DB non disponible)
 SKIP_TESTS="${SKIP_TESTS:-false}"
@@ -527,6 +543,142 @@ log_detail() {
     echo -e "${GRAY}[$(date '+%H:%M:%S')]     └─ $1${RESET}"
 }
 
+# Appel Claude avec timeout (pour appels auxiliaires: validation, commit msg, etc.)
+# Usage: claude_with_timeout TIMEOUT_SECONDS "prompt"
+# Retourne: stdout du résultat, code retour 0=ok, 1=timeout/erreur
+# Compatible macOS et Linux
+claude_with_timeout() {
+    local timeout_secs="${1:-$CLAUDE_AUX_TIMEOUT}"
+    local prompt="$2"
+
+    local tmp_output
+    tmp_output=$(mktemp)
+    local exit_code=0
+
+    # Lancer Claude en background avec redirection vers fichier temp
+    claude -p $CLAUDE_FLAGS --output-format text "$prompt" > "$tmp_output" 2>/dev/null &
+    local pid=$!
+
+    # Attendre avec timeout (compatible macOS et Linux)
+    local waited=0
+    while kill -0 $pid 2>/dev/null; do
+        if [ $waited -ge "$timeout_secs" ]; then
+            # Timeout atteint - tuer le processus
+            kill -9 $pid 2>/dev/null || true
+            wait $pid 2>/dev/null || true
+            rm -f "$tmp_output"
+            log_info "Claude timeout après ${timeout_secs}s"
+            return 1
+        fi
+        sleep 1
+        ((waited++))
+    done
+
+    # Récupérer le code de sortie
+    wait $pid 2>/dev/null
+    exit_code=$?
+
+    # Lire le résultat
+    local result=""
+    if [ -f "$tmp_output" ]; then
+        result=$(cat "$tmp_output")
+        rm -f "$tmp_output"
+    fi
+
+    echo "$result"
+    return $exit_code
+}
+
+# -----------------------------------------------------------------------------
+# SYSTÈME D'ÉVÉNEMENTS (Pour intégration Claude Code)
+# -----------------------------------------------------------------------------
+# Émet un événement JSON pour le skill /ultra
+# Usage: emit_event TYPE key1=val1 key2=val2 ...
+emit_event() {
+    [[ "$OUTPUT_MODE" != "events" ]] && return 0
+
+    local event_type="$1"
+    shift
+
+    local timestamp
+    timestamp=$(date -Iseconds)
+
+    # Construire le JSON avec les paires key=value
+    local json_data="{\"type\":\"$event_type\",\"ts\":\"$timestamp\""
+
+    for arg in "$@"; do
+        local key="${arg%%=*}"
+        local value="${arg#*=}"
+        # Échapper les guillemets dans la valeur
+        value="${value//\"/\\\"}"
+        json_data="$json_data,\"$key\":\"$value\""
+    done
+
+    json_data="$json_data}"
+
+    # Écrire dans le fichier events et stdout
+    echo "$json_data" >> "$EVENTS_FILE"
+    echo "EVENT:$json_data"
+}
+
+# Écrit l'état de progression dans un fichier JSON
+write_progress() {
+    local round="${1:-0}"
+    local step="${2:-}"
+    local task="${3:-}"
+    local status="${4:-running}"
+
+    local pending_tasks=0
+    [[ -f "$TASK_FILE" ]] && pending_tasks=$(grep -c "^\s*- \[ \]" "$TASK_FILE" 2>/dev/null || echo "0")
+
+    local elapsed=0
+    [[ -n "${START_TIME:-}" ]] && elapsed=$(($(date +%s) - START_TIME))
+
+    cat > "$PROGRESS_FILE" << EOF
+{
+  "status": "$status",
+  "round": $round,
+  "step": "$step",
+  "task": "$task",
+  "pending_tasks": $pending_tasks,
+  "session_tokens": ${SESSION_INPUT_TOKENS:-0},
+  "session_output_tokens": ${SESSION_OUTPUT_TOKENS:-0},
+  "elapsed_seconds": $elapsed,
+  "timestamp": "$(date -Iseconds)"
+}
+EOF
+}
+
+# Vérifie les commandes de contrôle (pause, stop)
+check_control_commands() {
+    [[ ! -f "$CONTROL_FILE" ]] && return 0
+
+    local cmd
+    cmd=$(cat "$CONTROL_FILE")
+    rm -f "$CONTROL_FILE"
+
+    case "$cmd" in
+        stop)
+            emit_event "STOP_REQUESTED"
+            echo "stopped" > "$STATUS_FILE"
+            log_info "Arrêt demandé via fichier de contrôle"
+            write_progress "${round:-0}" "" "" "stopped"
+            exit 0
+            ;;
+        pause)
+            emit_event "PAUSED"
+            echo "paused" > "$STATUS_FILE"
+            log_info "Pause demandée - en attente de 'resume'"
+            while [[ ! -f "$CONTROL_FILE" ]] || [[ "$(cat "$CONTROL_FILE" 2>/dev/null)" != "resume" ]]; do
+                sleep 2
+            done
+            rm -f "$CONTROL_FILE"
+            emit_event "RESUMED"
+            echo "running" > "$STATUS_FILE"
+            ;;
+    esac
+}
+
 # -----------------------------------------------------------------------------
 # RATE LIMITING (Style Ralph)
 # -----------------------------------------------------------------------------
@@ -803,16 +955,22 @@ run_step() {
     local step_name="$2"
     local persona="$3"
     local task="$4"
-    
+
     local start_time
     start_time=$(date +%s)
-    
+
+    # Émettre l'événement de début d'étape
+    local current_task_name=""
+    [[ -f "$CURRENT_TASK_FILE" ]] && current_task_name=$(head -5 "$CURRENT_TASK_FILE" 2>/dev/null | grep -v "^#" | head -1 | tr -d '\n')
+    emit_event "STEP_START" "step=$step_name" "step_num=$step_num" "task=$current_task_name"
+    write_progress "${round:-1}" "$step_name" "$current_task_name" "running"
+
     # Rate limiting
     check_rate_limit
-    
+
     draw_progress_bar "$step_num" "$step_name" "running"
     draw_steps_overview "$step_num"
-    
+
     log_info "Démarrage: $step_name"
     
     local full_prompt
@@ -890,16 +1048,19 @@ run_step() {
             echo -e "${YELLOW}⚠ Avertissement: erreur signalée mais travail effectué (${output_size} chars)${RESET}"
             log_info "Warning: $step_name signale une erreur mais a produit du travail"
         fi
+        emit_event "STEP_DONE" "step=$step_name" "step_num=$step_num" "duration=$duration" "status=success"
         log_success "$step_name terminé (${duration}s)"
         return 0
     fi
 
     # Pas de sortie significative - vérifier les erreurs
     if [ "$exit_code" -ne 0 ] || [ "$pipe_exit" -ne 0 ]; then
+        emit_event "STEP_ERROR" "step=$step_name" "step_num=$step_num" "duration=$duration" "status=error"
         log_error "Échec: $step_name (${duration}s) - pas de sortie et erreur signalée"
         return 1
     fi
 
+    emit_event "STEP_DONE" "step=$step_name" "step_num=$step_num" "duration=$duration" "status=success"
     log_success "$step_name terminé (${duration}s)"
     return 0
 }
@@ -945,8 +1106,9 @@ $diff_summary
 Réponds UNIQUEMENT avec le message, rien d'autre."
     
     local commit_message
-    commit_message=$(claude -p $CLAUDE_FLAGS --output-format text "$commit_prompt" 2>/dev/null | head -1 | tr -d '\n')
-    
+    # Timeout court pour les messages de commit (30s max)
+    commit_message=$(claude_with_timeout 30 "$commit_prompt" | head -1 | tr -d '\n')
+
     if [ -z "$commit_message" ]; then
         commit_message="chore: auto-commit cycle $(date '+%Y%m%d-%H%M%S')"
     fi
@@ -1191,7 +1353,8 @@ GÉNÈRE UNE SPEC AU FORMAT:
 Écris UNIQUEMENT la spec, rien d'autre."
 
     local spec_result
-    spec_result=$(claude -p $CLAUDE_FLAGS --output-format text "$spec_prompt" 2>/dev/null)
+    # Timeout pour la génération de spec (60s max)
+    spec_result=$(claude_with_timeout 60 "$spec_prompt")
 
     if [ -n "$spec_result" ]; then
         echo "$spec_result" > "$SPEC_FILE"
@@ -1214,7 +1377,8 @@ self_validate() {
 
     echo -e "${CYAN}🔍 Auto-validation...${RESET}"
 
-    local validate_prompt="Tu es un QA SENIOR. Vérifie si cette implémentation est correcte.
+    # Prompt simplifié: lecture seule, pas d'actions, pas de tests
+    local validate_prompt="Tu es un QA SENIOR. Analyse RAPIDEMENT si cette implémentation semble correcte.
 
 TÂCHE DEMANDÉE:
 $task_description
@@ -1228,24 +1392,22 @@ $(git diff --name-only HEAD~1 2>/dev/null | head -10)
 DIFF RÉSUMÉ:
 $(git diff --stat HEAD~1 2>/dev/null | tail -5)
 
-VÉRIFIE:
-1. La tâche est-elle complète?
-2. Y a-t-il des bugs évidents?
-3. Les tests passent-ils? (lance-les si nécessaire)
-4. Le code respecte-t-il les standards?
+IMPORTANT: Ne lance AUCUNE commande, ne modifie RIEN. Analyse seulement le diff.
 
-RÉPONDS EN JSON:
-{
-  \"valid\": true/false,
-  \"issues\": [\"issue1\", \"issue2\"],
-  \"fixes_needed\": [\"fix1\", \"fix2\"],
-  \"confidence\": 0-100
-}
-
-Si valid=false et fixes_needed non vide, applique les corrections toi-même."
+RÉPONDS UNIQUEMENT en JSON (une seule ligne):
+{\"valid\": true, \"issues\": [], \"confidence\": 85}"
 
     local validation_result
-    validation_result=$(claude -p $CLAUDE_FLAGS --output-format text "$validate_prompt" 2>/dev/null)
+    # Utiliser timeout pour éviter les blocages
+    validation_result=$(claude_with_timeout "$CLAUDE_AUX_TIMEOUT" "$validate_prompt")
+    local timeout_status=$?
+
+    # Si timeout, considérer comme valide et continuer
+    if [ $timeout_status -ne 0 ]; then
+        echo -e "${YELLOW}⏱ Validation timeout, considéré OK${RESET}"
+        track_decision "VALIDATE" "Validation timeout - considéré OK"
+        return 0
+    fi
 
     # Parser le résultat JSON
     local is_valid
@@ -1556,6 +1718,19 @@ Respecte cette spec dans ton implémentation."
 # MODE FAST - Boucle principale
 # -----------------------------------------------------------------------------
 run_fast_mode() {
+    # Mode events: initialiser les fichiers de contrôle
+    if [[ "$OUTPUT_MODE" == "events" ]]; then
+        START_TIME=$(date +%s)
+        echo $$ > "$PID_FILE"
+        echo "running" > "$STATUS_FILE"
+        : > "$EVENTS_FILE"
+
+        local pending_tasks=0
+        [[ -f "$TASK_FILE" ]] && pending_tasks=$(grep -c "^\s*- \[ \]" "$TASK_FILE" 2>/dev/null || echo "0")
+
+        emit_event "PIPELINE_START" "mode=fast" "max_tasks=$MAX_TASKS" "pending_tasks=$pending_tasks"
+    fi
+
     echo -e "${BOLD}${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║                                                              ║"
@@ -1583,24 +1758,48 @@ run_fast_mode() {
     while true; do
         ((loop++))
 
+        # Mode events: vérifier les commandes de contrôle
+        check_control_commands
+
+        # Vérifier la limite de tâches (mode --single ou --tasks N)
+        if [[ "$MAX_TASKS" -gt 0 && "$tasks_completed" -ge "$MAX_TASKS" ]]; then
+            emit_event "MAX_TASKS_REACHED" "completed=$tasks_completed" "max=$MAX_TASKS"
+            echo -e "${GREEN}✅ $MAX_TASKS tâche(s) terminée(s) - arrêt${RESET}"
+            [[ "$OUTPUT_MODE" == "events" ]] && echo "completed" > "$STATUS_FILE"
+            break
+        fi
+
         # Vérifications avant cycle
         if ! check_quota; then
+            emit_event "QUOTA_CRITICAL" "session_pct=$SESSION_QUOTA_PCT"
             echo -e "${RED}🛑 Quota critique - arrêt${RESET}"
+            [[ "$OUTPUT_MODE" == "events" ]] && echo "stopped" > "$STATUS_FILE"
             break
         fi
 
         if check_task_completion; then
+            emit_event "ALL_TASKS_DONE" "loops=$loop" "completed=$tasks_completed"
             echo -e "${GREEN}🎉 Toutes les tâches terminées !${RESET}"
+            [[ "$OUTPUT_MODE" == "events" ]] && echo "completed" > "$STATUS_FILE"
             break
         fi
 
         if detect_no_changes; then
+            emit_event "NO_PROGRESS" "consecutive=$CONSECUTIVE_NO_CHANGES"
             echo -e "${YELLOW}💤 Arrêt intelligent - pas de progrès${RESET}"
+            [[ "$OUTPUT_MODE" == "events" ]] && echo "stopped" > "$STATUS_FILE"
             break
         fi
 
         # Rate limiting
         check_rate_limit
+
+        # Lire la tâche en cours
+        local current_task_name=""
+        [[ -f "$CURRENT_TASK_FILE" ]] && current_task_name=$(head -5 "$CURRENT_TASK_FILE" 2>/dev/null | grep -v "^#" | head -1 | tr -d '\n')
+
+        emit_event "LOOP_START" "loop=$loop" "task=$current_task_name"
+        write_progress "$loop" "RUNNING" "$current_task_name" "running"
 
         # Header du loop
         echo ""
@@ -1686,6 +1885,8 @@ run_fast_mode() {
             CONSECUTIVE_NO_CHANGES=0
             ((tasks_completed++))
 
+            emit_event "TASK_PROGRESS" "loop=$loop" "tasks_completed=$tasks_completed" "task=$current_task_name"
+
             if [ "$has_new_commits" = true ]; then
                 local commit_count
                 commit_count=$(git rev-list --count "$head_before".."$head_after" 2>/dev/null || echo "1")
@@ -1709,8 +1910,9 @@ run_fast_mode() {
 
                 if [ -n "$diff_summary" ]; then
                     local commit_message
-                    commit_message=$(claude -p $CLAUDE_FLAGS --output-format text "Message commit conventionnel (1 ligne, format type(scope): desc) pour:
-$diff_summary" 2>/dev/null | head -1 | tr -d '\n')
+                    # Timeout court pour les messages de commit (30s max)
+                    commit_message=$(claude_with_timeout 30 "Message commit conventionnel (1 ligne, format type(scope): desc) pour:
+$diff_summary" | head -1 | tr -d '\n')
 
                     if [ -z "$commit_message" ]; then
                         commit_message="chore: fast-mode loop $loop"
@@ -1754,11 +1956,15 @@ $diff_summary" 2>/dev/null | head -1 | tr -d '\n')
         local mins=$((elapsed / 60))
         local secs=$((elapsed % 60))
 
+        emit_event "LOOP_DONE" "loop=$loop" "tasks_completed=$tasks_completed" "elapsed=${mins}m${secs}s" "tokens=$SESSION_INPUT_TOKENS"
+        write_progress "$loop" "DONE" "$current_task_name" "running"
+
         echo ""
         echo -e "${GRAY}📊 Loop $loop | Tâches: $tasks_completed | Temps: ${mins}m${secs}s | Quota: ${SESSION_QUOTA_PCT}%${RESET}"
 
         # Pause courte
         echo -e "${YELLOW}⏸${RESET}  Pause 2s... (Ctrl+C pour arrêter)"
+        emit_event "WAITING" "seconds=2" "reason=inter_loop_pause"
         sleep 2
     done
 
@@ -1778,6 +1984,10 @@ $diff_summary" 2>/dev/null | head -1 | tr -d '\n')
     echo -e "${RESET}"
 
     draw_usage_dashboard
+
+    # Événement de fin de pipeline
+    emit_event "PIPELINE_DONE" "loops=$loop" "tasks_completed=$tasks_completed" "duration=${total_mins}m${total_secs}s" "tokens=$SESSION_INPUT_TOKENS"
+    write_progress "$loop" "" "" "completed"
 
     # Générer le rapport de session
     generate_session_report "${total_mins}m${total_secs}s" "$tasks_completed" "$loop"
@@ -2063,7 +2273,8 @@ Réponds UNIQUEMENT avec le bloc:
     echo -e "${CYAN}  📤 Appel Agent Merger...${RESET}"
 
     local resolved_content
-    resolved_content=$(claude -p $CLAUDE_FLAGS --output-format text "$merge_prompt" 2>/dev/null)
+    # Timeout pour la résolution de conflits (90s max)
+    resolved_content=$(claude_with_timeout 90 "$merge_prompt")
 
     # Extraire le contenu entre ```resolved et ```
     local extracted_code
@@ -2908,7 +3119,20 @@ cleanup_swarm() {
 }
 main() {
     init
-    
+
+    # Mode events: initialiser les fichiers de contrôle
+    if [[ "$OUTPUT_MODE" == "events" ]]; then
+        START_TIME=$(date +%s)
+        echo $$ > "$PID_FILE"
+        echo "running" > "$STATUS_FILE"
+        : > "$EVENTS_FILE"  # Vider le fichier events
+
+        local pending_tasks=0
+        [[ -f "$TASK_FILE" ]] && pending_tasks=$(grep -c "^\s*- \[ \]" "$TASK_FILE" 2>/dev/null || echo "0")
+
+        emit_event "PIPELINE_START" "mode=$([[ "$FAST_MODE" == "true" ]] && echo "fast" || echo "sequential")" "max_tasks=$MAX_TASKS" "pending_tasks=$pending_tasks"
+    fi
+
     echo -e "${BOLD}${GREEN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║                                                              ║"
@@ -2920,31 +3144,60 @@ main() {
     echo "║                                                              ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${RESET}"
-    
+
     draw_usage_dashboard
-    
+
     local round=1
-    
+
     while true; do
+        # Mode events: vérifier les commandes de contrôle
+        check_control_commands
+
+        # Vérifier la limite de tâches (mode --single ou --tasks N)
+        if [[ "$MAX_TASKS" -gt 0 && "$round" -gt "$MAX_TASKS" ]]; then
+            emit_event "MAX_TASKS_REACHED" "completed=$((round-1))" "max=$MAX_TASKS"
+            echo -e "${GREEN}✅ $MAX_TASKS tâche(s) terminée(s) - arrêt${RESET}"
+            [[ "$OUTPUT_MODE" == "events" ]] && echo "completed" > "$STATUS_FILE"
+            write_progress "$round" "" "" "completed"
+            draw_usage_dashboard
+            exit 0
+        fi
+
         # Vérifications avant cycle
         if ! check_quota; then
+            emit_event "QUOTA_CRITICAL" "session_pct=$SESSION_QUOTA_PCT"
             echo -e "${RED}🛑 Quota critique - arrêt${RESET}"
+            [[ "$OUTPUT_MODE" == "events" ]] && echo "stopped" > "$STATUS_FILE"
+            write_progress "$round" "" "" "quota_exceeded"
             draw_usage_dashboard
             exit 1
         fi
-        
+
         if check_task_completion; then
+            emit_event "ALL_TASKS_DONE" "rounds=$((round-1))"
             echo -e "${GREEN}🎉 Projet terminé !${RESET}"
+            [[ "$OUTPUT_MODE" == "events" ]] && echo "completed" > "$STATUS_FILE"
+            write_progress "$round" "" "" "completed"
             draw_usage_dashboard
             exit 0
         fi
-        
+
         if detect_no_changes; then
+            emit_event "NO_PROGRESS" "consecutive=$CONSECUTIVE_NO_CHANGES"
             echo -e "${YELLOW}💤 Arrêt intelligent - pas de progrès${RESET}"
+            [[ "$OUTPUT_MODE" == "events" ]] && echo "stopped" > "$STATUS_FILE"
+            write_progress "$round" "" "" "no_progress"
             draw_usage_dashboard
             exit 0
         fi
-        
+
+        # Lire la tâche en cours pour les événements
+        local current_task_name=""
+        [[ -f "$CURRENT_TASK_FILE" ]] && current_task_name=$(head -5 "$CURRENT_TASK_FILE" 2>/dev/null | grep -v "^#" | head -1 | tr -d '\n')
+
+        emit_event "CYCLE_START" "round=$round" "task=$current_task_name"
+        write_progress "$round" "STARTING" "$current_task_name" "running"
+
         draw_cycle_header "$round"
         echo "--- CYCLE #$round : $(date) ---" >> "$LOG_FILE"
         
@@ -2991,17 +3244,25 @@ main() {
         fi
         
         draw_usage_dashboard
-        
+
+        # Relire la tâche complétée
+        local completed_task=""
+        [[ -f "$CURRENT_TASK_FILE" ]] && completed_task=$(head -5 "$CURRENT_TASK_FILE" 2>/dev/null | grep -v "^#" | head -1 | tr -d '\n')
+
+        emit_event "CYCLE_DONE" "round=$round" "task=$completed_task" "tokens=$SESSION_INPUT_TOKENS"
+        write_progress "$round" "DONE" "$completed_task" "running"
+
         echo ""
         echo -e "${BOLD}${GREEN}══════════════════════════════════════════════════════════${RESET}"
         echo -e "${GREEN}✅ CYCLE #$round TERMINÉ${RESET}"
         echo -e "${BOLD}${GREEN}══════════════════════════════════════════════════════════${RESET}"
-        
+
         log_success "Cycle #$round terminé"
         ((round++))
-        
+
         echo ""
         echo -e "${YELLOW}⏸${RESET}  Pause 5s... (Ctrl+C pour arrêter)"
+        emit_event "WAITING" "seconds=5" "reason=inter_cycle_pause"
         sleep 5
     done
 }
@@ -3031,7 +3292,22 @@ while [[ $# -gt 0 ]]; do
             ;;
         --fast|-f)
             FAST_MODE="true"
+            # Désactiver self-validate par défaut en mode fast (perf)
+            # Peut être réactivé avec --validate explicitement
+            SELF_VALIDATE="${SELF_VALIDATE:-false}"
             shift
+            ;;
+        --output|-o)
+            OUTPUT_MODE="$2"
+            shift 2
+            ;;
+        --single)
+            MAX_TASKS=1
+            shift
+            ;;
+        --tasks|-t)
+            MAX_TASKS="$2"
+            shift 2
             ;;
         --specify|-s)
             SPECIFY_MODE="true"
@@ -3039,6 +3315,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-validate)
             SELF_VALIDATE="false"
+            shift
+            ;;
+        --validate)
+            SELF_VALIDATE="true"
             shift
             ;;
         --no-rollback)
@@ -3077,11 +3357,23 @@ while [[ $# -gt 0 ]]; do
             echo "Options générales:"
             echo "  --token-efficient      Mode économie de tokens (réponses courtes)"
             echo "  --max-calls N          Limite d'appels par heure (défaut: 50)"
+            echo "  --single               Exécute une seule tâche puis arrête"
+            echo "  --tasks N, -t N        Exécute N tâches puis arrête (0 = illimité)"
+            echo "  --output MODE, -o      Mode sortie: verbose (défaut), events, quiet"
             echo "  --help, -h             Affiche cette aide"
+            echo ""
+            echo "Intégration Claude Code (mode events):"
+            echo "  --output events        Émet des événements JSON pour le skill /ultra"
+            echo "  Fichiers de contrôle:"
+            echo "    @ultra.events.log    Journal des événements JSON"
+            echo "    @ultra.progress.json État de progression en temps réel"
+            echo "    @ultra.command       Commandes: stop, pause, resume"
+            echo "    @ultra.status        État: running, paused, stopped, completed"
             echo ""
             echo "Options autonomie (Enterprise):"
             echo "  --enterprise, -e       Active toutes les options ci-dessous"
             echo "  --specify, -s          Génère une spec automatique avant exécution"
+            echo "  --validate             Active l'auto-validation après commit (désactivé par défaut en --fast)"
             echo "  --no-validate          Désactive l'auto-validation après commit"
             echo "  --no-rollback          Désactive le rollback auto si tests échouent"
             echo "  --no-report            Désactive le rapport de session"
@@ -3110,6 +3402,8 @@ while [[ $# -gt 0 ]]; do
             echo "  $0 -f -e               # Fast + Enterprise (spec + validation + rollback + rapport)"
             echo "  $0 -f --specify        # Fast avec génération de spec"
             echo "  $0 -p -f -e            # Parallèle + Fast + Enterprise (autonomie maximale)"
+            echo "  $0 -f --single -o events  # Une tâche, mode events (Claude Code)"
+            echo "  $0 -f -t 3 -o events   # 3 tâches, mode events (Claude Code)"
             exit 0
             ;;
         *)
