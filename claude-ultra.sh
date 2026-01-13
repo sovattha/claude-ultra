@@ -1901,11 +1901,13 @@ run_fast_mode() {
                 done
             fi
 
+            # Variable pour self_validate (doit être déclarée avant le bloc conditionnel)
+            local diff_summary=""
+
             # Auto-commit des changements non commités restants
             if [ "$has_uncommitted_changes" = true ]; then
                 git add -A
 
-                local diff_summary
                 diff_summary=$(git diff --cached --stat | tail -3)
 
                 if [ -n "$diff_summary" ]; then
