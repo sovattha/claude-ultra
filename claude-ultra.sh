@@ -41,14 +41,8 @@ HOUR_START=$(date +%s)
 MAX_CONSECUTIVE_NO_CHANGES=3
 CONSECUTIVE_NO_CHANGES=0
 
-# Mode persistent (ne s'arrête jamais automatiquement)
+# Mode persistent (ne s'arrête jamais, découpe les grosses tâches automatiquement)
 PERSISTENT_MODE="${PERSISTENT_MODE:-false}"
-
-# Mode token-efficient (style SuperClaude)
-TOKEN_EFFICIENT_MODE="${TOKEN_EFFICIENT_MODE:-false}"
-
-# Mode fast (1 appel Claude par cycle, style Ralph)
-FAST_MODE="${FAST_MODE:-false}"
 
 # Mode output: verbose (défaut), events (JSON), quiet (minimal)
 OUTPUT_MODE="${OUTPUT_MODE:-verbose}"
@@ -62,39 +56,6 @@ PROGRESS_FILE="@ultra.progress.json"
 CONTROL_FILE="@ultra.command"
 STATUS_FILE="@ultra.status"
 PID_FILE="@ultra.pid"
-
-# -----------------------------------------------------------------------------
-# AMÉLIORATIONS AUTONOMIE (Style Enterprise)
-# -----------------------------------------------------------------------------
-# Phase Specify: génère une spec automatique avant implémentation
-SPECIFY_MODE="${SPECIFY_MODE:-false}"
-SPEC_FILE="@spec.md"
-
-# Self-validation: l'agent vérifie sa propre sortie
-SELF_VALIDATE="${SELF_VALIDATE:-true}"
-
-# Rollback automatique: revert si tests échouent après N tentatives
-AUTO_ROLLBACK="${AUTO_ROLLBACK:-true}"
-MAX_TEST_RETRIES=2
-CURRENT_TEST_RETRIES=0
-
-# Timeout pour l'exécution des tests (en secondes, 0 = pas de timeout)
-TEST_TIMEOUT="${TEST_TIMEOUT:-300}"  # 5 minutes par défaut
-
-# Timeout pour les appels Claude auxiliaires (validation, commit msg, etc.)
-CLAUDE_AUX_TIMEOUT="${CLAUDE_AUX_TIMEOUT:-60}"  # 60 secondes par défaut
-
-# Skip les tests (utile si les tests nécessitent une DB non disponible)
-SKIP_TESTS="${SKIP_TESTS:-false}"
-
-# Rapport de fin: génère un résumé des décisions
-GENERATE_REPORT="${GENERATE_REPORT:-true}"
-REPORT_FILE="@session-report.md"
-
-# Tracking des décisions pour le rapport
-declare -a SESSION_DECISIONS=()
-declare -a SESSION_TASKS_COMPLETED=()
-declare -a SESSION_ROLLBACKS=()
 
 # -----------------------------------------------------------------------------
 # MODE PARALLÈLE (Git Worktrees)
@@ -120,11 +81,6 @@ CYAN='\033[0;36m'
 GRAY='\033[0;90m'
 BOLD='\033[1m'
 RESET='\033[0m'
-
-# Définition des étapes du cycle
-STEPS=("PRODUCT OWNER" "ARCHITECT" "IMPLEMENTER" "REFACTORER" "QA ENGINEER" "SECURITY AUDITOR" "DOCUMENTER" "COMMITEUR")
-STEP_ICONS=("📋" "🏗️" "💻" "🧹" "🧪" "🔒" "📝" "📦")
-TOTAL_STEPS=${#STEPS[@]}
 
 # -----------------------------------------------------------------------------
 # CONFIGURATION QUOTA API (Claude Max)
@@ -169,190 +125,6 @@ RÈGLE ABSOLUE - PAS DE QUESTIONS:
 - AGIS directement, prends des décisions, implémente
 - Si tu as un doute, choisis l'option la plus raisonnable et avance"
 
-PERSONA_PO="Tu es un PRODUCT OWNER Senior avec 15 ans d'expérience.
-${MCP_TOOLS}
-${NO_QUESTIONS}
-
-EXPERTISE:
-- Priorisation MoSCoW et WSJF
-- User stories INVEST
-- Découpage vertical des features
-- Impact business et ROI
-
-TA MISSION UNIQUE:
-1. Analyse $TASK_FILE et identifie UNE tâche prioritaire faisable en <30min
-2. Écris ta décision dans le fichier $CURRENT_TASK_FILE avec ce format exact:
-
-# Tâche Sélectionnée
-[Nom de la tâche]
-
-## Description
-[Ce qu'il faut faire concrètement]
-
-## Fichiers concernés
-[Liste des fichiers à modifier]
-
-## Critères de succès
-- [ ] [Critère 1]
-- [ ] [Critère 2]
-
-## Justification
-[Pourquoi cette tâche en priorité]
-
-3. AGIS: crée/mets à jour le fichier $CURRENT_TASK_FILE maintenant
-
-RÈGLES ABSOLUES:
-- [CRITICAL] Écris TOUJOURS dans $CURRENT_TASK_FILE
-- [CRITICAL] Une seule tâche par cycle
-- [CRITICAL] La tâche doit être completable en <30 min
-- [HIGH] Privilégie les quick wins à fort impact"
-
-PERSONA_ARCHITECT="Tu es un SOFTWARE ARCHITECT Senior spécialisé Clean Architecture.
-${MCP_TOOLS}
-${NO_QUESTIONS}
-
-UTILISE Context7 POUR:
-- Vérifier les patterns officiels des frameworks utilisés
-- Consulter la doc des librairies avant de les intégrer
-
-EXPERTISE:
-- Clean Architecture / Hexagonal / Onion
-- Domain-Driven Design (DDD)
-- SOLID principles
-- Design Patterns (GoF, Enterprise)
-
-TA MISSION:
-1. Lis le fichier $CURRENT_TASK_FILE pour connaître la tâche à implémenter
-2. Analyse si la tâche respecte l'architecture existante
-3. Si des fichiers doivent être créés/modifiés, mets à jour $CURRENT_TASK_FILE avec les détails techniques
-4. AGIS: ajoute les détails d'architecture dans $CURRENT_TASK_FILE
-
-RÈGLES ABSOLUES:
-- [CRITICAL] Lis $CURRENT_TASK_FILE en premier
-- [CRITICAL] Dependency Rule: dépendances vers l'intérieur uniquement
-- [CRITICAL] Entities ne dépendent de rien
-- [HIGH] Use Cases orchestrent, ne contiennent pas de logique infra"
-
-PERSONA_IMPLEMENTER="Tu es un SENIOR DEVELOPER avec expertise TDD.
-${MCP_TOOLS}
-${NO_QUESTIONS}
-
-UTILISE Context7 POUR:
-- Consulter la doc officielle AVANT chaque nouvelle API/lib
-- Vérifier la syntaxe exacte des fonctions
-
-UTILISE Sequential-thinking POUR:
-- Décomposer les implémentations complexes
-- Planifier l'ordre des tests TDD
-
-TA MISSION:
-1. Lis $CURRENT_TASK_FILE pour connaître exactement ce que tu dois implémenter
-2. Applique TDD strict:
-   - Écris d'abord le test qui échoue (RED)
-   - Écris le code minimal pour passer (GREEN)
-   - Refactorise si nécessaire
-3. AGIS: implémente la fonctionnalité MAINTENANT
-
-RÈGLES ABSOLUES:
-- [CRITICAL] Lis $CURRENT_TASK_FILE en premier
-- [CRITICAL] Aucun code sans test correspondant
-- [CRITICAL] Fonctions pures quand possible
-- [HIGH] Pas de commentaires, code auto-documenté
-- [HIGH] Early return, pas de nested if
-- [MEDIUM] Max 20 lignes par fonction"
-
-PERSONA_REFACTORER="Tu es un REFACTORING EXPERT obsédé par la qualité.
-${MCP_TOOLS}
-${NO_QUESTIONS}
-
-UTILISE Sequential-thinking POUR:
-- Analyser les dépendances avant refactoring
-- Planifier les étapes de refactoring en séquence sûre
-
-TA MISSION:
-1. Analyse le code modifié dans ce cycle (git diff)
-2. Identifie les code smells avec leurs noms exacts
-3. AGIS: refactorise UN smell à la fois, vérifie que les tests passent
-
-RÈGLES ABSOLUES:
-- [CRITICAL] Ne jamais changer le comportement
-- [CRITICAL] Tests verts avant ET après
-- [HIGH] Un refactoring = un commit
-- [MEDIUM] Documente le smell corrigé"
-
-PERSONA_QA="Tu es un QA ENGINEER Senior avec expertise testing.
-${MCP_TOOLS}
-${NO_QUESTIONS}
-
-UTILISE Playwright POUR:
-- Tests E2E cross-browser (Chromium, Firefox, WebKit)
-- Simuler les interactions utilisateur réelles
-- Capturer des screenshots de régression
-
-UTILISE Chrome DevTools POUR:
-- Vérifier les erreurs console
-- Analyser les requêtes réseau
-- Détecter les memory leaks
-
-TA MISSION:
-1. Lis $CURRENT_TASK_FILE pour connaître ce qui a été implémenté
-2. Vérifie que tous les tests passent (lance-les!)
-3. Identifie les edge cases non testés
-4. AGIS: écris les tests manquants MAINTENANT
-
-RÈGLES ABSOLUES:
-- [CRITICAL] Lance les tests existants d'abord
-- [CRITICAL] Teste les cas limites: null, undefined, empty, max, min
-- [CRITICAL] Teste les erreurs: network, timeout, invalid input
-- [HIGH] Arrange-Act-Assert pattern
-- [HIGH] Un test = un comportement"
-
-PERSONA_SECURITY="Tu es un SECURITY ENGINEER spécialisé AppSec.
-${MCP_TOOLS}
-${NO_QUESTIONS}
-
-UTILISE Context7 POUR:
-- Vérifier les best practices de sécurité des frameworks
-- Consulter la doc des libs de validation/sanitization
-
-UTILISE Chrome DevTools POUR:
-- Inspecter les headers de sécurité (CSP, CORS, etc.)
-- Vérifier les cookies (HttpOnly, Secure, SameSite)
-- Analyser les requêtes pour détecter les fuites de données
-
-TA MISSION:
-1. Analyse le code modifié dans ce cycle (git diff)
-2. Cherche les vulnérabilités OWASP Top 10
-3. AGIS: corrige les vulnérabilités Critical/High MAINTENANT
-
-RÈGLES ABSOLUES:
-- [CRITICAL] Jamais de secrets en dur
-- [CRITICAL] Toujours valider/sanitizer les inputs
-- [CRITICAL] Parameterized queries uniquement
-- [HIGH] Principe du moindre privilège
-- [HIGH] Escape output selon contexte (HTML, JS, SQL)"
-
-PERSONA_DOCUMENTER="Tu es un TECHNICAL WRITER Senior.
-${MCP_TOOLS}
-${NO_QUESTIONS}
-
-UTILISE Context7 POUR:
-- Vérifier le format standard de documentation des libs utilisées
-- S'inspirer des bonnes pratiques de doc officielles
-
-TA MISSION:
-1. Lis $CURRENT_TASK_FILE pour connaître ce qui a été fait
-2. Mets à jour $TASK_FILE: marque la tâche comme [x] terminée avec la date
-3. Mets à jour $ARCHITECTURE_FILE si des choix architecturaux ont été faits
-4. AGIS: mets à jour la documentation MAINTENANT
-5. Supprime le fichier $CURRENT_TASK_FILE quand tu as fini
-
-RÈGLES ABSOLUES:
-- [CRITICAL] $TASK_FILE doit refléter l'état réel
-- [CRITICAL] Marquer la tâche terminée avec date: - [x] Tâche (YYYY-MM-DD)
-- [HIGH] $ARCHITECTURE_FILE à jour avec les choix
-- [HIGH] Supprimer $CURRENT_TASK_FILE à la fin"
-
 PERSONA_MERGER="Tu es un GIT MERGE EXPERT avec 15 ans d'expérience en gestion de conflits.
 ${MCP_TOOLS}
 ${NO_QUESTIONS}
@@ -390,64 +162,6 @@ RÈGLES ABSOLUES:
 - [CRITICAL] Préserver les tests des deux côtés
 - [HIGH] Garder le meilleur des deux implémentations
 - [HIGH] Documenter brièvement le choix si significatif"
-
-# -----------------------------------------------------------------------------
-# MODE TOKEN-EFFICIENT (Style SuperClaude)
-# -----------------------------------------------------------------------------
-TOKEN_EFFICIENT_SUFFIX=""
-if [ "$TOKEN_EFFICIENT_MODE" = "true" ]; then
-    TOKEN_EFFICIENT_SUFFIX="
-
-MODE ULTRA-COMPACT ACTIVÉ:
-- Utilise symboles: → (leads to), & (and), w/ (with), != (not equal)
-- Pas de phrases complètes, bullet points uniquement
-- Code sans commentaires
-- Pas d'explications, juste les actions
-- Réponse max 500 tokens"
-fi
-
-# -----------------------------------------------------------------------------
-# PROMPTS COMBINÉS (Persona + Context + Rules)
-# -----------------------------------------------------------------------------
-build_prompt() {
-    local persona="$1"
-    local task="$2"
-    local context=""
-    
-    # Charger le contexte local si présent
-    if [ -f "$CONTEXT_FILE" ]; then
-        context="CONTEXTE PROJET: $(cat "$CONTEXT_FILE")"
-    fi
-    
-    # Charger le fix_plan si présent (style Ralph)
-    local fix_plan=""
-    if [ -f "$FIX_PLAN_FILE" ]; then
-        fix_plan="
-PLAN DE CORRECTION PRIORITAIRE (@fix_plan.md):
-$(cat "$FIX_PLAN_FILE")
-
-INSTRUCTION: Suis ce plan en priorité si applicable."
-    fi
-    
-    # Charger la config agent si présente (style Ralph)
-    local agent_config=""
-    if [ -f "$AGENT_CONFIG_FILE" ]; then
-        agent_config="
-CONFIGURATION AGENT (@AGENT.md):
-$(cat "$AGENT_CONFIG_FILE")"
-    fi
-    
-    echo "${persona}
-
-${context}
-${fix_plan}
-${agent_config}
-
-TÂCHE ACTUELLE:
-${task}
-
-${TOKEN_EFFICIENT_SUFFIX}"
-}
 
 # -----------------------------------------------------------------------------
 # INITIALISATION
@@ -956,259 +670,6 @@ draw_steps_overview() {
 }
 
 # -----------------------------------------------------------------------------
-# EXÉCUTION D'UNE ÉTAPE
-# -----------------------------------------------------------------------------
-run_step() {
-    local step_num="$1"
-    local step_name="$2"
-    local persona="$3"
-    local task="$4"
-
-    local start_time
-    start_time=$(date +%s)
-
-    # Émettre l'événement de début d'étape
-    local current_task_name=""
-    [[ -f "$CURRENT_TASK_FILE" ]] && current_task_name=$(head -5 "$CURRENT_TASK_FILE" 2>/dev/null | grep -v "^#" | head -1 | tr -d '\n')
-    emit_event "STEP_START" "step=$step_name" "step_num=$step_num" "task=$current_task_name"
-    write_progress "${round:-1}" "$step_name" "$current_task_name" "running"
-
-    # Rate limiting
-    check_rate_limit
-
-    draw_progress_bar "$step_num" "$step_name" "running"
-    draw_steps_overview "$step_num"
-
-    log_info "Démarrage: $step_name"
-    
-    local full_prompt
-    full_prompt=$(build_prompt "$persona" "$task")
-    
-    echo -e "${GRAY}─────────────────────────────────────────────────────────${RESET}"
-    echo -e "${CYAN}📤 $step_name:${RESET}"
-    echo ""
-    
-    local tmp_output
-    tmp_output=$(mktemp)
-    
-    local exit_code=0
-    
-    claude -p $CLAUDE_FLAGS --verbose --output-format stream-json "$full_prompt" 2>&1 | \
-    while IFS= read -r line; do
-        local msg_type
-        msg_type=$(echo "$line" | jq -r '.type // empty' 2>/dev/null)
-        
-        case "$msg_type" in
-            "system")
-                local model
-                model=$(echo "$line" | jq -r '.model // empty' 2>/dev/null)
-                if [ -n "$model" ]; then
-                    echo -e "  ${GRAY}│ 🤖 $model${RESET}"
-                fi
-                ;;
-            "assistant")
-                local content
-                content=$(echo "$line" | jq -r '.message.content[]? | select(.type == "text") | .text // empty' 2>/dev/null)
-                if [ -n "$content" ]; then
-                    echo "$content" | while IFS= read -r text_line; do
-                        echo -e "  │ $text_line"
-                        echo "$text_line" >> "$tmp_output"
-                    done
-                fi
-                ;;
-            "result")
-                update_usage_from_result "$line"
-                local is_error
-                is_error=$(echo "$line" | jq -r '.is_error // false' 2>/dev/null)
-                if [ "$is_error" = "true" ]; then
-                    # Marquer comme erreur potentielle, mais on vérifiera si du travail a été fait
-                    exit_code=1
-                fi
-                ;;
-        esac
-    done
-
-    local pipe_exit=${PIPESTATUS[0]:-0}
-
-    local output_size=0
-    if [ -f "$tmp_output" ]; then
-        output_size=$(wc -c < "$tmp_output" | tr -d ' ')
-        echo "[CLAUDE - $step_name]" >> "$LOG_FILE"
-        cat "$tmp_output" >> "$LOG_FILE"
-        rm -f "$tmp_output"
-    fi
-
-    echo ""
-    echo -e "${GRAY}─────────────────────────────────────────────────────────${RESET}"
-
-    local end_time
-    end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-
-    # Logique de succès améliorée:
-    # - Si Claude a produit une sortie significative (>100 chars), on considère que le travail est fait
-    # - Même si is_error=true ou pipe_exit!=0, c'est souvent un faux positif
-    # - On ne fail que si vraiment aucune sortie n'a été produite ET erreur signalée
-
-    if [ "$output_size" -gt 100 ]; then
-        # Travail significatif produit - succès même si erreur signalée
-        if [ "$exit_code" -ne 0 ] || [ "$pipe_exit" -ne 0 ]; then
-            echo -e "${YELLOW}⚠ Avertissement: erreur signalée mais travail effectué (${output_size} chars)${RESET}"
-            log_info "Warning: $step_name signale une erreur mais a produit du travail"
-        fi
-        emit_event "STEP_DONE" "step=$step_name" "step_num=$step_num" "duration=$duration" "status=success"
-        log_success "$step_name terminé (${duration}s)"
-        return 0
-    fi
-
-    # Pas de sortie significative - vérifier les erreurs
-    if [ "$exit_code" -ne 0 ] || [ "$pipe_exit" -ne 0 ]; then
-        emit_event "STEP_ERROR" "step=$step_name" "step_num=$step_num" "duration=$duration" "status=error"
-        log_error "Échec: $step_name (${duration}s) - pas de sortie et erreur signalée"
-        return 1
-    fi
-
-    emit_event "STEP_DONE" "step=$step_name" "step_num=$step_num" "duration=$duration" "status=success"
-    log_success "$step_name terminé (${duration}s)"
-    return 0
-}
-
-# -----------------------------------------------------------------------------
-# ÉTAPE COMMITEUR
-# -----------------------------------------------------------------------------
-run_commit_step() {
-    local step_num="$1"
-    
-    draw_progress_bar "$step_num" "COMMITEUR" "running"
-    draw_steps_overview "$step_num"
-    
-    log_info "Vérification des changements..."
-    
-    if git diff --quiet && git diff --cached --quiet; then
-        log_info "Aucun changement à commiter"
-        echo -e "${YELLOW}ℹ${RESET}  Aucun fichier modifié"
-        return 0
-    fi
-    
-    echo -e "${CYAN}📋 Changements:${RESET}"
-    git status --short | head -10 | while read -r line; do
-        echo -e "  ${GRAY}│${RESET} $line"
-    done
-    
-    git add -A
-    
-    check_rate_limit
-    
-    local diff_summary
-    diff_summary=$(git diff --cached --stat | tail -5)
-    
-    local commit_prompt="Génère un message de commit conventionnel.
-Format: type(scope): description
-
-Types: feat|fix|refactor|docs|test|chore
-Scope: le module/fichier principal modifié
-
-Changements:
-$diff_summary
-
-Réponds UNIQUEMENT avec le message, rien d'autre."
-    
-    local commit_message
-    # Timeout court pour les messages de commit (30s max)
-    commit_message=$(claude_with_timeout 30 "$commit_prompt" | head -1 | tr -d '\n')
-
-    if [ -z "$commit_message" ]; then
-        commit_message="chore: auto-commit cycle $(date '+%Y%m%d-%H%M%S')"
-    fi
-    
-    echo -e "${CYAN}📦 Commit:${RESET} $commit_message"
-    
-    if git commit -m "$commit_message" >> "$LOG_FILE" 2>&1; then
-        log_success "Commit: $commit_message"
-        local commit_hash
-        commit_hash=$(git rev-parse --short HEAD)
-        echo -e "  ${GRAY}└─ Hash: ${commit_hash}${RESET}"
-        # Reset le compteur de "no changes" car un commit = du progrès
-        CONSECUTIVE_NO_CHANGES=0
-    else
-        log_error "Échec du commit"
-        return 1
-    fi
-    
-    return 0
-}
-
-# -----------------------------------------------------------------------------
-# PROMPTS DES TÂCHES (Directifs, pas de questions)
-# -----------------------------------------------------------------------------
-TASK_PO="MODE AUTONOME - AGIS MAINTENANT.
-
-1. Lis $TASK_FILE et identifie les tâches non terminées (- [ ])
-2. Sélectionne UNE SEULE tâche faisable en moins de 30 minutes
-3. Crée le fichier $CURRENT_TASK_FILE avec ta décision (format spécifié dans ton persona)
-4. NE POSE PAS DE QUESTION - décide et écris le fichier
-
-Si aucune tâche actionnable: crée une tâche d'amélioration technique."
-
-TASK_ARCHITECT="MODE AUTONOME - AGIS MAINTENANT.
-
-1. Lis $CURRENT_TASK_FILE pour connaître la tâche sélectionnée par le PO
-2. Analyse si l'implémentation respecte Clean Architecture
-3. Identifie les fichiers à créer/modifier
-4. Ajoute une section '## Architecture' dans $CURRENT_TASK_FILE avec:
-   - Les fichiers concernés
-   - La couche de chaque fichier
-   - Les patterns à utiliser
-5. NE POSE PAS DE QUESTION - analyse et mets à jour le fichier"
-
-TASK_IMPLEMENTER="MODE AUTONOME - AGIS MAINTENANT.
-
-1. Lis $CURRENT_TASK_FILE pour connaître exactement ce que tu dois faire
-2. Applique TDD strict:
-   a) Écris le test qui échoue (RED)
-   b) Écris le code minimal pour passer (GREEN)  
-   c) Lance les tests pour vérifier
-3. Implémente la fonctionnalité décrite dans $CURRENT_TASK_FILE
-4. NE POSE PAS DE QUESTION - code directement"
-
-TASK_REFACTORER="MODE AUTONOME - AGIS MAINTENANT.
-
-1. Exécute: git diff HEAD~1 pour voir le code modifié
-2. Identifie les code smells (Long Method, Feature Envy, etc.)
-3. Si smell trouvé: refactorise-le (tests verts avant/après)
-4. Si aucun smell: passe à l'étape suivante
-5. NE POSE PAS DE QUESTION - refactorise ou passe"
-
-TASK_QA="MODE AUTONOME - AGIS MAINTENANT.
-
-1. Lis $CURRENT_TASK_FILE pour connaître ce qui a été implémenté
-2. Lance les tests existants: npm test ou pytest
-3. Identifie les edge cases non testés (null, empty, erreurs)
-4. Écris les tests manquants
-5. MOCK OBLIGATOIRE: tous les tests doivent fonctionner SANS connexion DB/réseau
-   - Mock Prisma, Supabase, fetch, et toute dépendance externe
-   - Utilise vi.mock(), jest.mock() ou équivalent
-6. NE POSE PAS DE QUESTION - teste et corrige"
-
-TASK_SECURITY="MODE AUTONOME - AGIS MAINTENANT.
-
-1. Exécute: git diff HEAD~1 pour voir le code modifié
-2. Cherche les vulnérabilités OWASP Top 10:
-   - Injection (SQL, XSS, Command)
-   - Secrets en dur
-   - Auth faible
-3. Si vulnérabilité Critical/High: corrige-la immédiatement
-4. NE POSE PAS DE QUESTION - audite et corrige"
-
-TASK_DOCUMENTER="MODE AUTONOME - AGIS MAINTENANT.
-
-1. Lis $CURRENT_TASK_FILE pour savoir ce qui a été fait
-2. Dans $TASK_FILE: transforme la ligne '- [ ] tâche' en '- [x] tâche ($(date +%Y-%m-%d))'
-3. Si choix d'architecture fait: mets à jour $ARCHITECTURE_FILE
-4. Supprime le fichier $CURRENT_TASK_FILE (rm $CURRENT_TASK_FILE)
-5. NE POSE PAS DE QUESTION - documente et nettoie"
-
-# -----------------------------------------------------------------------------
 # MODE FAST - Prompt unifié (1 appel = 1 tâche complète)
 # -----------------------------------------------------------------------------
 FAST_PROMPT="Tu es un DÉVELOPPEUR SENIOR AUTONOME avec expertise full-stack et DevOps.
@@ -1223,6 +684,15 @@ WORKFLOW EN 6 ÉTAPES:
    - Lis $TASK_FILE et choisis UNE tâche non terminée (- [ ])
    - Privilégie les quick wins à fort impact
    - La tâche doit être faisable en <30 min
+
+   DÉCOUPAGE AUTOMATIQUE (si aucun quick win):
+   - Si TOUTES les tâches restantes sont trop grosses (>30 min estimées)
+   - Découpe la première tâche en 3-5 sous-tâches atomiques
+   - Ajoute les sous-tâches au $TASK_FILE avec indentation:
+     - [ ] Grosse tâche (DÉCOMPOSÉE)
+       - [ ] Sous-tâche 1
+       - [ ] Sous-tâche 2
+   - Ensuite, sélectionne et implémente la première sous-tâche
 
 2. IMPLÉMENTATION (TDD)
    - Écris d'abord le test qui échoue (RED)
@@ -1307,419 +777,7 @@ ${agent_config}
 ${current_task}
 ${tasks}
 
-${TOKEN_EFFICIENT_SUFFIX}
-
 AGIS MAINTENANT. Choisis une tâche et implémente-la complètement."
-}
-
-# -----------------------------------------------------------------------------
-# AMÉLIORATIONS AUTONOMIE - FONCTIONS
-# -----------------------------------------------------------------------------
-
-# Phase Specify: génère une spec automatique à partir de TODO.md
-generate_spec() {
-    if [ "$SPECIFY_MODE" != "true" ]; then
-        return 0
-    fi
-
-    # Skip si spec existe déjà et est récente (< 1 heure)
-    if [ -f "$SPEC_FILE" ]; then
-        local spec_age=$(($(date +%s) - $(stat -f %m "$SPEC_FILE" 2>/dev/null || stat -c %Y "$SPEC_FILE" 2>/dev/null || echo 0)))
-        if [ $spec_age -lt 3600 ]; then
-            log_info "Spec existante (< 1h), réutilisation"
-            return 0
-        fi
-    fi
-
-    echo -e "${CYAN}📋 Génération de la spécification...${RESET}"
-
-    local spec_prompt="Tu es un PRODUCT MANAGER Senior. Analyse le projet et génère une SPEC TECHNIQUE.
-
-FICHIERS À ANALYSER:
-- TODO.md: $(cat "$TASK_FILE" 2>/dev/null || echo "Vide")
-- ARCHITECTURE.md: $(head -50 "$ARCHITECTURE_FILE" 2>/dev/null || echo "Non trouvé")
-
-GÉNÈRE UNE SPEC AU FORMAT:
-
-# Spécification du Projet
-
-## Vue d'ensemble
-[Résumé du projet en 2-3 phrases]
-
-## Objectifs de la session
-[Liste des tâches à accomplir, par priorité]
-
-## Contraintes techniques
-[Stack, patterns, règles à respecter]
-
-## Critères de succès
-[Comment savoir si c'est terminé]
-
-## Risques identifiés
-[Potentiels blocages et mitigations]
-
-Écris UNIQUEMENT la spec, rien d'autre."
-
-    local spec_result
-    # Timeout pour la génération de spec (60s max)
-    spec_result=$(claude_with_timeout 60 "$spec_prompt")
-
-    if [ -n "$spec_result" ]; then
-        echo "$spec_result" > "$SPEC_FILE"
-        echo -e "${GREEN}✓ Spec générée: $SPEC_FILE${RESET}"
-        track_decision "SPECIFY" "Spec générée automatiquement"
-        log_success "Spec générée: $SPEC_FILE"
-    else
-        log_error "Échec génération spec"
-    fi
-}
-
-# Self-validation: vérifie que la sortie est correcte
-self_validate() {
-    local task_description="$1"
-    local changes_summary="$2"
-
-    if [ "$SELF_VALIDATE" != "true" ]; then
-        return 0
-    fi
-
-    echo -e "${CYAN}🔍 Auto-validation...${RESET}"
-
-    # Prompt simplifié: lecture seule, pas d'actions, pas de tests
-    local validate_prompt="Tu es un QA SENIOR. Analyse RAPIDEMENT si cette implémentation semble correcte.
-
-TÂCHE DEMANDÉE:
-$task_description
-
-CHANGEMENTS EFFECTUÉS:
-$changes_summary
-
-FICHIERS MODIFIÉS:
-$(git diff --name-only HEAD~1 2>/dev/null | head -10)
-
-DIFF RÉSUMÉ:
-$(git diff --stat HEAD~1 2>/dev/null | tail -5)
-
-IMPORTANT: Ne lance AUCUNE commande, ne modifie RIEN. Analyse seulement le diff.
-
-RÉPONDS UNIQUEMENT en JSON (une seule ligne):
-{\"valid\": true, \"issues\": [], \"confidence\": 85}"
-
-    local validation_result
-    # Utiliser timeout pour éviter les blocages
-    validation_result=$(claude_with_timeout "$CLAUDE_AUX_TIMEOUT" "$validate_prompt")
-    local timeout_status=$?
-
-    # Si timeout, considérer comme valide et continuer
-    if [ $timeout_status -ne 0 ]; then
-        echo -e "${YELLOW}⏱ Validation timeout, considéré OK${RESET}"
-        track_decision "VALIDATE" "Validation timeout - considéré OK"
-        return 0
-    fi
-
-    # Parser le résultat JSON
-    local is_valid
-    is_valid=$(echo "$validation_result" | jq -r '.valid // true' 2>/dev/null || echo "true")
-    local confidence
-    confidence=$(echo "$validation_result" | jq -r '.confidence // 80' 2>/dev/null || echo "80")
-
-    if [ "$is_valid" = "true" ]; then
-        echo -e "${GREEN}✓ Validation OK (confiance: ${confidence}%)${RESET}"
-        track_decision "VALIDATE" "Auto-validation réussie (${confidence}%)"
-        return 0
-    else
-        local issues
-        issues=$(echo "$validation_result" | jq -r '.issues[]?' 2>/dev/null | head -3)
-        echo -e "${YELLOW}⚠ Validation: issues détectées${RESET}"
-        echo "$issues" | while read -r issue; do
-            echo -e "  ${GRAY}└─ $issue${RESET}"
-        done
-        track_decision "VALIDATE" "Issues détectées: $issues"
-        return 1
-    fi
-}
-
-# Rollback automatique si tests échouent
-auto_rollback() {
-    local commit_to_revert="$1"
-
-    if [ "$AUTO_ROLLBACK" != "true" ]; then
-        return 0
-    fi
-
-    ((CURRENT_TEST_RETRIES++))
-
-    if [ $CURRENT_TEST_RETRIES -ge $MAX_TEST_RETRIES ]; then
-        echo -e "${RED}🔄 Rollback automatique après $MAX_TEST_RETRIES échecs${RESET}"
-
-        if [ -n "$commit_to_revert" ]; then
-            git revert --no-commit "$commit_to_revert" 2>/dev/null
-            git checkout HEAD -- . 2>/dev/null
-
-            local rollback_msg="Rollback: tests échoués après $MAX_TEST_RETRIES tentatives"
-            SESSION_ROLLBACKS+=("$(date '+%H:%M:%S') - $rollback_msg")
-            track_decision "ROLLBACK" "$rollback_msg"
-
-            echo -e "${YELLOW}↩ Revert effectué, passage à la tâche suivante${RESET}"
-            log_info "$rollback_msg"
-        fi
-
-        CURRENT_TEST_RETRIES=0
-        return 1
-    fi
-
-    echo -e "${YELLOW}⚠ Tentative $CURRENT_TEST_RETRIES/$MAX_TEST_RETRIES${RESET}"
-    return 0
-}
-
-# Exécuter les tests et gérer rollback
-run_tests_with_rollback() {
-    local commit_before="$1"
-
-    # DEBUG: Entrée dans la fonction
-    echo -e "${GRAY}[DEBUG] run_tests_with_rollback() appelée${RESET}"
-    echo "[DEBUG] run_tests_with_rollback() started at $(date)" >> "$LOG_FILE"
-
-    # Option pour skip les tests complètement
-    if [ "$SKIP_TESTS" = "true" ]; then
-        echo -e "${YELLOW}⏭ Tests ignorés (SKIP_TESTS=true)${RESET}"
-        track_decision "TESTS" "Tests ignorés par configuration"
-        CURRENT_TEST_RETRIES=0
-        return 0
-    fi
-
-    # Détecter le type de projet et lancer les tests appropriés
-    local test_cmd=""
-    local test_result=0
-    local test_framework=""
-
-    if [ -f "package.json" ]; then
-        if grep -q '"test"' package.json 2>/dev/null; then
-            # Détecter le framework de test (Vitest vs Jest vs autres)
-            if grep -qE '"vitest"|"@vitest"' package.json 2>/dev/null; then
-                test_framework="vitest"
-                # Vitest: utiliser --run pour mode non-interactif
-                test_cmd="npm test -- --run --reporter=basic"
-            elif grep -qE '"jest"|"@jest"' package.json 2>/dev/null; then
-                test_framework="jest"
-                # Jest: utiliser --watchAll=false et --ci
-                test_cmd="npm test -- --watchAll=false --ci --passWithNoTests"
-            else
-                test_framework="unknown"
-                # Fallback générique: essayer les deux syntaxes
-                test_cmd="npm test -- --run 2>/dev/null || npm test -- --watchAll=false --ci 2>/dev/null || CI=true npm test"
-            fi
-            echo -e "${GRAY}[DEBUG] Framework détecté: $test_framework${RESET}"
-            echo "[DEBUG] Test framework: $test_framework" >> "$LOG_FILE"
-        fi
-    elif [ -f "Cargo.toml" ]; then
-        test_cmd="cargo test"
-        test_framework="cargo"
-    elif [ -f "go.mod" ]; then
-        test_cmd="go test ./..."
-        test_framework="go"
-    elif [ -f "pytest.ini" ] || [ -f "setup.py" ] || [ -d "tests" ]; then
-        test_cmd="pytest -q"
-        test_framework="pytest"
-    elif [ -f "Makefile" ] && grep -q "^test:" Makefile 2>/dev/null; then
-        test_cmd="make test"
-        test_framework="make"
-    fi
-
-    if [ -z "$test_cmd" ]; then
-        # Pas de tests trouvés, considérer comme succès
-        echo -e "${GRAY}[DEBUG] Aucune commande de test trouvée, skip${RESET}"
-        CURRENT_TEST_RETRIES=0
-        return 0
-    fi
-
-    echo -e "${CYAN}🧪 Exécution des tests: $test_cmd${RESET}"
-    echo "[DEBUG] Running: $test_cmd" >> "$LOG_FILE"
-
-    # Exécuter avec timeout si configuré
-    local exit_code=0
-    if [ "$TEST_TIMEOUT" -gt 0 ] 2>/dev/null; then
-        echo -e "${GRAY}[DEBUG] Timeout configuré: ${TEST_TIMEOUT}s${RESET}"
-
-        # Timeout cross-platform (macOS + Linux)
-        # IMPORTANT: Fermer stdin avec < /dev/null pour éviter les blocages interactifs
-        ( eval "$test_cmd" < /dev/null >> "$LOG_FILE" 2>&1 ) &
-        local test_pid=$!
-        local waited=0
-
-        echo -e "${GRAY}[DEBUG] Test PID: $test_pid${RESET}"
-        echo "[DEBUG] Test PID: $test_pid" >> "$LOG_FILE"
-
-        while kill -0 $test_pid 2>/dev/null; do
-            if [ $waited -ge "$TEST_TIMEOUT" ]; then
-                echo -e "${GRAY}[DEBUG] Timeout atteint, killing PID $test_pid${RESET}"
-                echo "[DEBUG] Timeout reached, killing PID $test_pid" >> "$LOG_FILE"
-
-                # Tuer le processus et tous ses enfants
-                pkill -P $test_pid 2>/dev/null || true
-                kill -9 $test_pid 2>/dev/null || true
-                wait $test_pid 2>/dev/null || true
-
-                echo -e "${RED}✗ Tests timeout après ${TEST_TIMEOUT}s${RESET}"
-                track_decision "TESTS" "Tests timeout après ${TEST_TIMEOUT}s: $test_cmd"
-                if ! auto_rollback "$commit_before"; then
-                    return 1
-                fi
-                return 2
-            fi
-
-            # Afficher la progression toutes les 10 secondes
-            if [ $((waited % 10)) -eq 0 ] && [ $waited -gt 0 ]; then
-                echo -e "${GRAY}[DEBUG] Tests en cours... ${waited}s/${TEST_TIMEOUT}s${RESET}"
-            fi
-
-            sleep 1
-            ((waited++))
-        done
-
-        wait $test_pid
-        exit_code=$?
-        echo -e "${GRAY}[DEBUG] Tests terminés en ${waited}s avec code: $exit_code${RESET}"
-        echo "[DEBUG] Tests finished in ${waited}s with exit code: $exit_code" >> "$LOG_FILE"
-    else
-        echo -e "${GRAY}[DEBUG] Exécution sans timeout${RESET}"
-        # IMPORTANT: Fermer stdin avec < /dev/null pour éviter les blocages interactifs
-        eval "$test_cmd" < /dev/null >> "$LOG_FILE" 2>&1
-        exit_code=$?
-        echo -e "${GRAY}[DEBUG] Tests terminés avec code: $exit_code${RESET}"
-        echo "[DEBUG] Tests finished with exit code: $exit_code" >> "$LOG_FILE"
-    fi
-
-    if [ $exit_code -eq 0 ]; then
-        echo -e "${GREEN}✓ Tests passés${RESET}"
-        CURRENT_TEST_RETRIES=0
-        track_decision "TESTS" "Tests passés: $test_cmd"
-        return 0
-    else
-        echo -e "${RED}✗ Tests échoués (code: $exit_code)${RESET}"
-        # Afficher les dernières lignes du log pour debug
-        echo -e "${GRAY}[DEBUG] Dernières lignes du log:${RESET}"
-        tail -20 "$LOG_FILE" 2>/dev/null | head -10
-
-        track_decision "TESTS" "Tests échoués: $test_cmd"
-
-        if ! auto_rollback "$commit_before"; then
-            return 1
-        fi
-        return 2  # Retry possible
-    fi
-}
-
-# Tracker une décision pour le rapport
-track_decision() {
-    local category="$1"
-    local decision="$2"
-    local timestamp
-    timestamp=$(date '+%H:%M:%S')
-
-    SESSION_DECISIONS+=("[$timestamp] [$category] $decision")
-}
-
-# Générer le rapport de session
-generate_session_report() {
-    if [ "$GENERATE_REPORT" != "true" ]; then
-        return 0
-    fi
-
-    local end_time
-    end_time=$(date '+%Y-%m-%d %H:%M:%S')
-    local session_duration="$1"
-    local tasks_count="$2"
-    local loops_count="$3"
-
-    echo -e "${CYAN}📊 Génération du rapport de session...${RESET}"
-
-    cat > "$REPORT_FILE" << EOF
-# Rapport de Session Claude Ultra
-
-**Date:** $end_time
-**Durée:** ${session_duration}
-**Mode:** $([ "$FAST_MODE" = "true" ] && echo "Fast" || echo "Standard")
-
-## Résumé
-
-| Métrique | Valeur |
-|----------|--------|
-| Loops exécutés | $loops_count |
-| Tâches complétées | $tasks_count |
-| Quota utilisé | ${SESSION_QUOTA_PCT}% |
-| Tokens entrée | ${SESSION_INPUT_TOKENS} |
-| Tokens sortie | ${SESSION_OUTPUT_TOKENS} |
-
-## Décisions prises
-
-EOF
-
-    # Ajouter les décisions
-    if [ ${#SESSION_DECISIONS[@]} -gt 0 ]; then
-        for decision in "${SESSION_DECISIONS[@]}"; do
-            echo "- $decision" >> "$REPORT_FILE"
-        done
-    else
-        echo "_Aucune décision trackée_" >> "$REPORT_FILE"
-    fi
-
-    # Ajouter les tâches complétées
-    echo "" >> "$REPORT_FILE"
-    echo "## Tâches complétées" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-
-    # Extraire les tâches marquées [x] dans TODO.md
-    if [ -f "$TASK_FILE" ]; then
-        grep -E "^\s*- \[x\]" "$TASK_FILE" 2>/dev/null | head -20 | while read -r line; do
-            echo "- $line" >> "$REPORT_FILE"
-        done
-    fi
-
-    # Ajouter les rollbacks si présents
-    if [ ${#SESSION_ROLLBACKS[@]} -gt 0 ]; then
-        echo "" >> "$REPORT_FILE"
-        echo "## Rollbacks effectués" >> "$REPORT_FILE"
-        echo "" >> "$REPORT_FILE"
-        for rollback in "${SESSION_ROLLBACKS[@]}"; do
-            echo "- ⚠️ $rollback" >> "$REPORT_FILE"
-        done
-    fi
-
-    # Ajouter les commits de la session
-    echo "" >> "$REPORT_FILE"
-    echo "## Commits de la session" >> "$REPORT_FILE"
-    echo "" >> "$REPORT_FILE"
-    echo '```' >> "$REPORT_FILE"
-    git log --oneline -20 --since="2 hours ago" 2>/dev/null >> "$REPORT_FILE" || echo "Aucun commit récent" >> "$REPORT_FILE"
-    echo '```' >> "$REPORT_FILE"
-
-    echo "" >> "$REPORT_FILE"
-    echo "---" >> "$REPORT_FILE"
-    echo "_Rapport généré automatiquement par Claude Ultra_" >> "$REPORT_FILE"
-
-    echo -e "${GREEN}✓ Rapport généré: $REPORT_FILE${RESET}"
-    log_success "Rapport de session: $REPORT_FILE"
-}
-
-# Prompt enrichi avec spec si disponible
-build_fast_prompt_with_spec() {
-    local base_prompt
-    base_prompt=$(build_fast_prompt)
-
-    # Ajouter la spec si disponible
-    if [ -f "$SPEC_FILE" ]; then
-        local spec_content
-        spec_content=$(cat "$SPEC_FILE")
-        echo "${base_prompt}
-
-SPÉCIFICATION DU PROJET (@spec.md):
-${spec_content}
-
-Respecte cette spec dans ton implémentation."
-    else
-        echo "$base_prompt"
-    fi
 }
 
 # -----------------------------------------------------------------------------
@@ -1742,22 +800,13 @@ run_fast_mode() {
     echo -e "${BOLD}${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
     echo "║                                                              ║"
-    echo "║   ⚡ MODE FAST - 1 appel = 1 tâche complète                  ║"
-    echo "║   Style Ralph: prompt unifié, détection fin intelligente    ║"
+    echo "║   ⚡ CLAUDE ULTRA - Pipeline CI/CD Autonome                  ║"
+    echo "║   1 appel = 1 tâche complète | Détection fin intelligente   ║"
     echo "║                                                              ║"
-    echo "╠══════════════════════════════════════════════════════════════╣"
-    printf "║   Specify: %-5s  Validate: %-5s  Rollback: %-5s  Report: %-5s║\n" \
-        "$([ "$SPECIFY_MODE" = "true" ] && echo "ON" || echo "OFF")" \
-        "$([ "$SELF_VALIDATE" = "true" ] && echo "ON" || echo "OFF")" \
-        "$([ "$AUTO_ROLLBACK" = "true" ] && echo "ON" || echo "OFF")" \
-        "$([ "$GENERATE_REPORT" = "true" ] && echo "ON" || echo "OFF")"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${RESET}"
 
     draw_usage_dashboard
-
-    # Phase Specify: générer spec automatique si activé
-    generate_spec
 
     local loop=0
     local tasks_completed=0
@@ -1824,7 +873,7 @@ run_fast_mode() {
 
         # Construire le prompt (avec spec si disponible)
         local full_prompt
-        full_prompt=$(build_fast_prompt_with_spec)
+        full_prompt=$(build_fast_prompt)
 
         # Exécuter Claude (UN SEUL appel)
         echo -e "${CYAN}📤 Exécution Claude...${RESET}"
@@ -1932,30 +981,9 @@ $diff_summary" | head -1 | tr -d '\n')
                         local commit_hash=$(git rev-parse --short HEAD)
                         echo -e "${GREEN}📦 Commit:${RESET} $commit_message ${GRAY}($commit_hash)${RESET}"
                         log_success "Commit: $commit_message"
-                        track_decision "COMMIT" "$commit_message"
                     fi
                 fi
             fi
-
-            # Tests avec rollback automatique
-            local current_head
-            current_head=$(git rev-parse HEAD 2>/dev/null || echo "")
-            local test_result
-            run_tests_with_rollback "$head_before"
-            test_result=$?
-
-            if [ $test_result -eq 1 ]; then
-                # Rollback effectué, décrementer le compteur de tâches
-                ((tasks_completed--)) || true
-                continue
-            fi
-
-            # Self-validation (vérifie la qualité du travail)
-            local current_task_desc=""
-            if [ -f "$CURRENT_TASK_FILE" ]; then
-                current_task_desc=$(head -10 "$CURRENT_TASK_FILE")
-            fi
-            self_validate "$current_task_desc" "$diff_summary"
 
         else
             echo -e "${YELLOW}ℹ Pas de changements ce loop${RESET}"
@@ -2141,17 +1169,11 @@ echo "Git status: \$(git status --short 2>/dev/null | head -3)"
 # Lancer claude-ultra en mode single-task
 export PARALLEL_MODE=false
 export MAX_CONSECUTIVE_NO_CHANGES=2
-export FAST_MODE=${FAST_MODE:-false}
 
 # Exécuter le script principal (copié dans le worktree)
 if [ -f "./claude-ultra.sh" ]; then
-    if [ "\$FAST_MODE" = "true" ]; then
-        echo "Lancement de claude-ultra.sh en mode FAST..."
-        ./claude-ultra.sh --fast
-    else
-        echo "Lancement de claude-ultra.sh..."
-        ./claude-ultra.sh
-    fi
+    echo "Lancement de claude-ultra.sh..."
+    ./claude-ultra.sh
 else
     echo "claude-ultra.sh non trouvé, utilisation de Claude directement..."
     # Fallback: utiliser claude directement
@@ -2251,7 +1273,8 @@ resolve_single_conflict_with_ai() {
 
     # Construire le prompt pour le Merger
     local merge_prompt
-    merge_prompt=$(build_prompt "$PERSONA_MERGER" "
+    merge_prompt="${PERSONA_MERGER}
+
 FICHIER EN CONFLIT: $file_path
 BRANCHE SOURCE: $branch_name
 BRANCHE CIBLE: main
@@ -2272,7 +1295,7 @@ INSTRUCTIONS:
 Réponds UNIQUEMENT avec le bloc:
 \`\`\`resolved
 [ton code résolu ici]
-\`\`\`")
+\`\`\`"
 
     # Appeler Claude pour résoudre
     local tmp_response
@@ -2561,23 +1584,13 @@ analyze_task_conflicts() {
 
 # Boucle principale du mode parallèle
 run_parallel_mode() {
-    local mode_label="Mode Parallèle"
-    local mode_icon="🐝"
-    if [ "$FAST_MODE" = "true" ]; then
-        mode_label="Mode Parallèle + FAST ⚡"
-        mode_icon="🚀"
-    fi
-
     echo -e "${BOLD}${MAGENTA}"
     echo "╔══════════════════════════════════════════════════════════════════╗"
     echo "║                                                                  ║"
-    printf "║   %s CLAUDE SWARM - %-30s        ║\n" "$mode_icon" "$mode_label"
+    echo "║   🚀 CLAUDE SWARM - Mode Parallèle                              ║"
     echo "║                                                                  ║"
     echo "║   Agents: ${PARALLEL_AGENTS}                                                      ║"
     echo "║   Worktrees: ${WORKTREE_DIR}/                                          ║"
-    if [ "$FAST_MODE" = "true" ]; then
-    echo "║   Mode: FAST (1 appel unifié par agent)                         ║"
-    fi
     echo "║                                                                  ║"
     echo "╚══════════════════════════════════════════════════════════════════╝"
     echo -e "${RESET}"
@@ -3127,155 +2140,6 @@ cleanup_swarm() {
     
     exit 130
 }
-main() {
-    init
-
-    # Mode events: initialiser les fichiers de contrôle
-    if [[ "$OUTPUT_MODE" == "events" ]]; then
-        START_TIME=$(date +%s)
-        echo $$ > "$PID_FILE"
-        echo "running" > "$STATUS_FILE"
-        : > "$EVENTS_FILE"  # Vider le fichier events
-
-        local pending_tasks=0
-        [[ -f "$TASK_FILE" ]] && pending_tasks=$(grep -c "^\s*- \[ \]" "$TASK_FILE" 2>/dev/null || echo "0")
-
-        emit_event "PIPELINE_START" "mode=$([[ "$FAST_MODE" == "true" ]] && echo "fast" || echo "sequential")" "max_tasks=$MAX_TASKS" "pending_tasks=$pending_tasks"
-    fi
-
-    echo -e "${BOLD}${GREEN}"
-    echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║                                                              ║"
-    echo "║   🚀 DEV CYCLE ULTRA                                         ║"
-    echo "║   Autonome + SuperClaude Personas + Ralph Intelligence       ║"
-    echo "║                                                              ║"
-    echo "║   Logs: $LOG_FILE"
-    echo "║   Rate: ${MAX_CALLS_PER_HOUR}/h | Mode: $([ "$TOKEN_EFFICIENT_MODE" = "true" ] && echo "Efficient" || echo "Standard")"
-    echo "║                                                              ║"
-    echo "╚══════════════════════════════════════════════════════════════╝"
-    echo -e "${RESET}"
-
-    draw_usage_dashboard
-
-    local round=1
-
-    while true; do
-        # Mode events: vérifier les commandes de contrôle
-        check_control_commands
-
-        # Vérifier la limite de tâches (mode --single ou --tasks N)
-        if [[ "$MAX_TASKS" -gt 0 && "$round" -gt "$MAX_TASKS" ]]; then
-            emit_event "MAX_TASKS_REACHED" "completed=$((round-1))" "max=$MAX_TASKS"
-            echo -e "${GREEN}✅ $MAX_TASKS tâche(s) terminée(s) - arrêt${RESET}"
-            [[ "$OUTPUT_MODE" == "events" ]] && echo "completed" > "$STATUS_FILE"
-            write_progress "$round" "" "" "completed"
-            draw_usage_dashboard
-            exit 0
-        fi
-
-        # Vérifications avant cycle
-        if ! check_quota; then
-            emit_event "QUOTA_CRITICAL" "session_pct=$SESSION_QUOTA_PCT"
-            echo -e "${RED}🛑 Quota critique - arrêt${RESET}"
-            [[ "$OUTPUT_MODE" == "events" ]] && echo "stopped" > "$STATUS_FILE"
-            write_progress "$round" "" "" "quota_exceeded"
-            draw_usage_dashboard
-            exit 1
-        fi
-
-        if check_task_completion; then
-            emit_event "ALL_TASKS_DONE" "rounds=$((round-1))"
-            echo -e "${GREEN}🎉 Projet terminé !${RESET}"
-            [[ "$OUTPUT_MODE" == "events" ]] && echo "completed" > "$STATUS_FILE"
-            write_progress "$round" "" "" "completed"
-            draw_usage_dashboard
-            exit 0
-        fi
-
-        if detect_no_changes; then
-            emit_event "NO_PROGRESS" "consecutive=$CONSECUTIVE_NO_CHANGES"
-            echo -e "${YELLOW}💤 Arrêt intelligent - pas de progrès${RESET}"
-            [[ "$OUTPUT_MODE" == "events" ]] && echo "stopped" > "$STATUS_FILE"
-            write_progress "$round" "" "" "no_progress"
-            draw_usage_dashboard
-            exit 0
-        fi
-
-        # Lire la tâche en cours pour les événements
-        local current_task_name=""
-        [[ -f "$CURRENT_TASK_FILE" ]] && current_task_name=$(head -5 "$CURRENT_TASK_FILE" 2>/dev/null | grep -v "^#" | head -1 | tr -d '\n')
-
-        emit_event "CYCLE_START" "round=$round" "task=$current_task_name"
-        write_progress "$round" "STARTING" "$current_task_name" "running"
-
-        draw_cycle_header "$round"
-        echo "--- CYCLE #$round : $(date) ---" >> "$LOG_FILE"
-        
-        # Pipeline complet avec personas experts
-        
-        # 1. Product Owner
-        if ! run_step 1 "PRODUCT OWNER" "$PERSONA_PO" "$TASK_PO"; then
-            log_error "Échec PO"; exit 1
-        fi
-        
-        # 2. Architect
-        if ! run_step 2 "ARCHITECT" "$PERSONA_ARCHITECT" "$TASK_ARCHITECT"; then
-            log_error "Échec Architect"; exit 1
-        fi
-        
-        # 3. Implementer
-        if ! run_step 3 "IMPLEMENTER" "$PERSONA_IMPLEMENTER" "$TASK_IMPLEMENTER"; then
-            log_error "Échec Implementer"; exit 1
-        fi
-        
-        # 4. Refactorer
-        if ! run_step 4 "REFACTORER" "$PERSONA_REFACTORER" "$TASK_REFACTORER"; then
-            log_error "Échec Refactorer"; exit 1
-        fi
-        
-        # 5. QA Engineer
-        if ! run_step 5 "QA ENGINEER" "$PERSONA_QA" "$TASK_QA"; then
-            log_error "Échec QA"; exit 1
-        fi
-        
-        # 6. Security Auditor
-        if ! run_step 6 "SECURITY AUDITOR" "$PERSONA_SECURITY" "$TASK_SECURITY"; then
-            log_error "Échec Security"; exit 1
-        fi
-        
-        # 7. Documenter
-        if ! run_step 7 "DOCUMENTER" "$PERSONA_DOCUMENTER" "$TASK_DOCUMENTER"; then
-            log_error "Échec Documenter"; exit 1
-        fi
-        
-        # 8. Commiteur
-        if ! run_commit_step 8; then
-            log_error "Échec Commit"; exit 1
-        fi
-        
-        draw_usage_dashboard
-
-        # Relire la tâche complétée
-        local completed_task=""
-        [[ -f "$CURRENT_TASK_FILE" ]] && completed_task=$(head -5 "$CURRENT_TASK_FILE" 2>/dev/null | grep -v "^#" | head -1 | tr -d '\n')
-
-        emit_event "CYCLE_DONE" "round=$round" "task=$completed_task" "tokens=$SESSION_INPUT_TOKENS"
-        write_progress "$round" "DONE" "$completed_task" "running"
-
-        echo ""
-        echo -e "${BOLD}${GREEN}══════════════════════════════════════════════════════════${RESET}"
-        echo -e "${GREEN}✅ CYCLE #$round TERMINÉ${RESET}"
-        echo -e "${BOLD}${GREEN}══════════════════════════════════════════════════════════${RESET}"
-
-        log_success "Cycle #$round terminé"
-        ((round++))
-
-        echo ""
-        echo -e "${YELLOW}⏸${RESET}  Pause 5s... (Ctrl+C pour arrêter)"
-        emit_event "WAITING" "seconds=5" "reason=inter_cycle_pause"
-        sleep 5
-    done
-}
 
 # -----------------------------------------------------------------------------
 # GESTION DES SIGNAUX
@@ -3296,17 +2160,6 @@ while [[ $# -gt 0 ]]; do
             RESUME_MODE="true"
             shift
             ;;
-        --token-efficient)
-            TOKEN_EFFICIENT_MODE="true"
-            shift
-            ;;
-        --fast|-f)
-            FAST_MODE="true"
-            # Désactiver self-validate par défaut en mode fast (perf)
-            # Peut être réactivé avec --validate explicitement
-            SELF_VALIDATE="${SELF_VALIDATE:-false}"
-            shift
-            ;;
         --output|-o)
             OUTPUT_MODE="$2"
             shift 2
@@ -3319,37 +2172,9 @@ while [[ $# -gt 0 ]]; do
             MAX_TASKS="$2"
             shift 2
             ;;
-        --specify|-s)
-            SPECIFY_MODE="true"
-            shift
-            ;;
-        --no-validate)
-            SELF_VALIDATE="false"
-            shift
-            ;;
-        --validate)
-            SELF_VALIDATE="true"
-            shift
-            ;;
-        --no-rollback)
-            AUTO_ROLLBACK="false"
-            shift
-            ;;
         --persistent|--no-stop)
             PERSISTENT_MODE="true"
             MAX_CONSECUTIVE_NO_CHANGES=9999
-            shift
-            ;;
-        --no-report)
-            GENERATE_REPORT="false"
-            shift
-            ;;
-        --enterprise|-e)
-            # Mode enterprise: active toutes les améliorations
-            SPECIFY_MODE="true"
-            SELF_VALIDATE="true"
-            AUTO_ROLLBACK="true"
-            GENERATE_REPORT="true"
             shift
             ;;
         --max-calls)
@@ -3360,20 +2185,18 @@ while [[ $# -gt 0 ]]; do
             echo "Usage: $0 [options]"
             echo ""
             echo "Modes:"
-            echo "  (default)              Mode séquentiel (1 agent, pipeline 8 étapes)"
-            echo "  --fast, -f             Mode fast (1 appel = 1 tâche, ~7x plus rapide)"
-            echo "  --parallel, -p         Mode parallèle (N agents sur N tâches)"
-            echo "  --parallel --fast      Mode parallèle + fast (N agents rapides)"
+            echo "  (default)              Mode standard (1 appel Claude = 1 tâche)"
+            echo "  --parallel, -p         Mode parallèle (N agents sur N tâches via worktrees)"
             echo ""
             echo "Options mode parallèle:"
             echo "  --agents N, -a N       Nombre d'agents parallèles (défaut: 3)"
             echo "  --resume, -r           Reprendre les agents interrompus"
             echo ""
             echo "Options générales:"
-            echo "  --token-efficient      Mode économie de tokens (réponses courtes)"
-            echo "  --max-calls N          Limite d'appels par heure (défaut: 50)"
             echo "  --single               Exécute une seule tâche puis arrête"
             echo "  --tasks N, -t N        Exécute N tâches puis arrête (0 = illimité)"
+            echo "  --persistent, --no-stop  Mode persistant (découpe auto les grosses tâches)"
+            echo "  --max-calls N          Limite d'appels par heure (défaut: 50)"
             echo "  --output MODE, -o      Mode sortie: verbose (défaut), events, quiet"
             echo "  --help, -h             Affiche cette aide"
             echo ""
@@ -3385,24 +2208,11 @@ while [[ $# -gt 0 ]]; do
             echo "    @ultra.command       Commandes: stop, pause, resume"
             echo "    @ultra.status        État: running, paused, stopped, completed"
             echo ""
-            echo "Options autonomie (Enterprise):"
-            echo "  --enterprise, -e       Active toutes les options ci-dessous"
-            echo "  --specify, -s          Génère une spec automatique avant exécution"
-            echo "  --validate             Active l'auto-validation après commit (désactivé par défaut en --fast)"
-            echo "  --no-validate          Désactive l'auto-validation après commit"
-            echo "  --no-rollback          Désactive le rollback auto si tests échouent"
-            echo "  --persistent, --no-stop  Ne s'arrête jamais (ignore cycles sans changements)"
-            echo "  --no-report            Désactive le rapport de session"
-            echo ""
             echo "Fichiers de contrôle:"
             echo "  TODO.md                Tâches du projet (1 par ligne: - [ ] tâche)"
             echo "  @fix_plan.md           Plan de correction prioritaire (optionnel)"
             echo "  @AGENT.md              Configuration agent (optionnel)"
             echo "  ARCHITECTURE.md        Documentation architecture"
-            echo ""
-            echo "Fichiers générés (mode Enterprise):"
-            echo "  @spec.md               Spécification générée automatiquement"
-            echo "  @session-report.md     Rapport de session avec décisions"
             echo ""
             echo "Agent Merger (mode parallèle):"
             echo "  Quand des conflits Git surviennent entre branches parallèles,"
@@ -3410,16 +2220,12 @@ while [[ $# -gt 0 ]]; do
             echo "  les conflits en préservant les fonctionnalités des deux côtés."
             echo ""
             echo "Exemples:"
-            echo "  $0                     # Mode normal, pipeline 8 étapes"
-            echo "  $0 --fast              # Mode rapide, 1 appel/tâche (~7x plus rapide)"
-            echo "  $0 --parallel          # 3 agents parallèles sur 3 tâches"
-            echo "  $0 -p -a 5             # 5 agents parallèles sur 5 tâches"
-            echo "  $0 -f --token-efficient # Fast + économie tokens"
-            echo "  $0 -f -e               # Fast + Enterprise (spec + validation + rollback + rapport)"
-            echo "  $0 -f --specify        # Fast avec génération de spec"
-            echo "  $0 -p -f -e            # Parallèle + Fast + Enterprise (autonomie maximale)"
-            echo "  $0 -f --single -o events  # Une tâche, mode events (Claude Code)"
-            echo "  $0 -f -t 3 -o events   # 3 tâches, mode events (Claude Code)"
+            echo "  $0                     # Mode standard"
+            echo "  $0 --single            # Une seule tâche"
+            echo "  $0 --persistent        # Continue jusqu'à TODO.md vide"
+            echo "  $0 --parallel          # 3 agents parallèles"
+            echo "  $0 -p -a 5             # 5 agents parallèles"
+            echo "  $0 --single -o events  # Mode events (Claude Code)"
             exit 0
             ;;
         *)
@@ -3452,9 +2258,7 @@ trap cleanup SIGINT SIGTERM
 # -----------------------------------------------------------------------------
 if [ "$PARALLEL_MODE" = "true" ]; then
     run_parallel_mode
-elif [ "$FAST_MODE" = "true" ]; then
+else
     init
     run_fast_mode
-else
-    main
 fi
