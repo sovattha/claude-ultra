@@ -45,6 +45,9 @@ CONSECUTIVE_NO_CHANGES=0
 # Mode persistent (ne s'arrête jamais, découpe les grosses tâches automatiquement)
 PERSISTENT_MODE="${PERSISTENT_MODE:-false}"
 
+# Mode token-efficient (désactivé par défaut)
+TOKEN_EFFICIENT_MODE="${TOKEN_EFFICIENT_MODE:-false}"
+
 # Mode output: verbose (défaut), events (JSON), quiet (minimal)
 OUTPUT_MODE="${OUTPUT_MODE:-verbose}"
 
@@ -1426,6 +1429,12 @@ $diff_summary" | head -1 | tr -d '\n')
             if [ "$has_new_commits" = true ]; then
                 task_diff=$(git diff "$head_before".."$head_after" --stat 2>/dev/null | head -15)
                 files_changed=$(git diff "$head_before".."$head_after" --name-only 2>/dev/null | tr '\n' ', ')
+
+                # Si current_task_name est vide, essayer de l'extraire du commit ou TODO.md
+                if [ -z "$current_task_name" ]; then
+                    # Option 1: Extraire depuis le dernier commit message
+                    current_task_name=$(git log -1 --format='%s' 2>/dev/null | sed 's/^[a-z]*([^)]*): //' | head -1)
+                fi
             else
                 task_diff="$diff_summary"
                 files_changed=$(git diff --cached --name-only 2>/dev/null | tr '\n' ', ')
@@ -1506,9 +1515,6 @@ $diff_summary" | head -1 | tr -d '\n')
     # Événement de fin de pipeline
     emit_event "PIPELINE_DONE" "loops=$loop" "tasks_completed=$tasks_completed" "duration=${total_mins}m${total_secs}s" "tokens=$SESSION_INPUT_TOKENS"
     write_progress "$loop" "" "" "completed"
-
-    # Générer le rapport de session
-    generate_session_report "${total_mins}m${total_secs}s" "$tasks_completed" "$loop"
 }
 
 # -----------------------------------------------------------------------------
