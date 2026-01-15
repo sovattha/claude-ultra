@@ -10,6 +10,7 @@
 # =============================================================================
 
 VERSION="1.0.0"
+# Version history: 1.0.0 - Initial release with fast mode (unified persona), parallel mode (git worktrees + tmux), persistent mode
 
 set -uo pipefail
 # Note: -e removed to allow better error handling in parallel mode
@@ -56,6 +57,25 @@ PROGRESS_FILE="@ultra.progress.json"
 CONTROL_FILE="@ultra.command"
 STATUS_FILE="@ultra.status"
 PID_FILE="@ultra.pid"
+
+# -----------------------------------------------------------------------------
+# CUSTOMER EXPERIENCE TESTER
+# -----------------------------------------------------------------------------
+CX_ENABLED="${CX_ENABLED:-true}"
+CX_MAX_INTERACTIONS=2
+CX_LOG_FILE="$LOG_DIR/cx-tests-$(date +%Y%m%d).log"
+
+# -----------------------------------------------------------------------------
+# RISK ASSESSMENT (Catégorisation des stories)
+# -----------------------------------------------------------------------------
+RISK_ENABLED="${RISK_ENABLED:-true}"
+RISK_LOG_FILE="$LOG_DIR/risk-assessment-$(date +%Y%m%d).log"
+REVIEW_QUEUE_FILE="@review-queue.md"
+# Seuil de risque pour pause/review: LOW, MEDIUM, HIGH, NONE
+# NONE = jamais de pause (100% autonome), HIGH = pause seulement pour HIGH
+RISK_PAUSE_THRESHOLD="${RISK_PAUSE_THRESHOLD:-NONE}"
+# Auto-approve les tâches sous ce seuil (skip CX test pour LOW)
+RISK_AUTO_APPROVE="${RISK_AUTO_APPROVE:-LOW}"
 
 # -----------------------------------------------------------------------------
 # MODE PARALLÈLE (Git Worktrees)
@@ -727,6 +747,82 @@ RÈGLES ABSOLUES:
 - [HIGH] TDD strict: test first
 - [HIGH] Commit à la fin si changements"
 
+# -----------------------------------------------------------------------------
+# CUSTOMER EXPERIENCE TESTER PROMPT
+# -----------------------------------------------------------------------------
+CX_TESTER_PROMPT="Tu es un TESTEUR D'EXPÉRIENCE UTILISATEUR lambda (pas technique).
+Tu testes comme un vrai utilisateur qui découvre la fonctionnalité.
+
+CONTEXTE:
+- Tâche implémentée: %TASK%
+- Changements effectués:
+%DIFF%
+
+TON RÔLE:
+1. Te mettre dans la peau d'un utilisateur ordinaire
+2. Évaluer si l'implémentation est intuitive et utilisable
+3. Identifier les friction points potentiels
+
+ÉVALUATION (1 seule question ou action de test):
+- Pose UNE question concrète sur l'usage OU
+- Simule UNE action utilisateur typique
+
+APRÈS TA QUESTION/ACTION, TU DOIS CONCLURE:
+- Si ça semble OK → Réponds exactement: CX_RESULT:PASS
+- Si problème UX détecté → Réponds exactement: CX_RESULT:FAIL|<raison courte>
+
+FORMAT OBLIGATOIRE DE RÉPONSE:
+<question ou simulation d'action>
+
+CX_RESULT:PASS ou CX_RESULT:FAIL|raison"
+
+# -----------------------------------------------------------------------------
+# RISK ASSESSOR PROMPT
+# -----------------------------------------------------------------------------
+RISK_ASSESSOR_PROMPT="Tu es un ÉVALUATEUR DE RISQUE pour le développement logiciel.
+Analyse la tâche et les changements pour déterminer le niveau de risque.
+
+TÂCHE: %TASK%
+
+CHANGEMENTS:
+%DIFF%
+
+FICHIERS MODIFIÉS:
+%FILES%
+
+CRITÈRES D'ÉVALUATION:
+
+🟢 RISQUE FAIBLE (LOW):
+- Modifications mineures (typos, formatting, comments)
+- Patterns établis et répétitifs
+- Tests unitaires simples
+- Documentation/README
+- Refactoring local sans changement de comportement
+- Ajout de logs/metrics
+
+🟡 RISQUE MOYEN (MEDIUM):
+- Nouvelles fonctionnalités simples et isolées
+- Modifications de logique métier existante
+- Ajout de validations/vérifications
+- Nouveaux endpoints API simples
+- Intégration de services externes avec SDK standard
+
+🔴 RISQUE ÉLEVÉ (HIGH):
+- Nouvelles architectures ou patterns
+- Modifications de sécurité (auth, permissions, crypto)
+- Changements de schéma DB ou migrations
+- Code touchant aux paiements/transactions
+- Modifications multi-fichiers avec couplage fort
+- Edge cases complexes ou gestion d'erreurs critiques
+- Code concurrent/parallèle
+- Suppression de fonctionnalités existantes
+
+RÉPONDS EXACTEMENT AVEC CE FORMAT:
+RISK_LEVEL:<LOW|MEDIUM|HIGH>
+RISK_REASON:<explication en 1 ligne>
+REVIEW_NEEDED:<true|false>
+REVIEW_FOCUS:<si review needed, quoi vérifier>"
+
 # Fonction pour construire le prompt fast avec contexte
 build_fast_prompt() {
     local context=""
@@ -778,6 +874,345 @@ ${current_task}
 ${tasks}
 
 AGIS MAINTENANT. Choisis une tâche et implémente-la complètement."
+}
+
+# -----------------------------------------------------------------------------
+# CUSTOMER EXPERIENCE TESTER - Fonction de test UX
+# -----------------------------------------------------------------------------
+run_cx_test() {
+    local task_name="$1"
+    local diff_summary="$2"
+    local loop_num="$3"
+
+    # Skip si CX désactivé
+    if [[ "$CX_ENABLED" != "true" ]]; then
+        return 0
+    fi
+
+    echo -e "${CYAN}🧪 Test Expérience Client...${RESET}"
+
+    # Construire le prompt CX avec le contexte
+    local cx_prompt="${CX_TESTER_PROMPT}"
+    cx_prompt="${cx_prompt//%TASK%/$task_name}"
+    cx_prompt="${cx_prompt//%DIFF%/$diff_summary}"
+
+    # Timestamp pour le log
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local cx_log_entry="
+================================================================================
+[CX TEST] $timestamp | Loop #$loop_num | Task: $task_name
+================================================================================
+"
+
+    local interaction=0
+    local cx_result="PENDING"
+    local cx_reason=""
+    local full_response=""
+
+    while [[ $interaction -lt $CX_MAX_INTERACTIONS && "$cx_result" == "PENDING" ]]; do
+        ((interaction++))
+
+        echo -e "  ${GRAY}│ Interaction $interaction/$CX_MAX_INTERACTIONS${RESET}"
+
+        # Appel Claude avec timeout court (60s)
+        local response=""
+        response=$(claude_with_timeout 60 "$cx_prompt" 2>/dev/null)
+
+        if [ -z "$response" ]; then
+            echo -e "  ${YELLOW}│ Pas de réponse CX (timeout)${RESET}"
+            cx_log_entry+="[Interaction $interaction] TIMEOUT - pas de réponse
+"
+            break
+        fi
+
+        full_response+="[Interaction $interaction]
+$response
+"
+
+        # Afficher la question/action du testeur
+        local question_part=$(echo "$response" | grep -v "CX_RESULT:" | head -5)
+        if [ -n "$question_part" ]; then
+            echo -e "  ${MAGENTA}│ 🧑 CX:${RESET} $(echo "$question_part" | head -1)"
+        fi
+
+        # Extraire le résultat CX
+        if echo "$response" | grep -q "CX_RESULT:PASS"; then
+            cx_result="PASS"
+            echo -e "  ${GREEN}│ ✓ Test CX: PASS${RESET}"
+        elif echo "$response" | grep -q "CX_RESULT:FAIL"; then
+            cx_result="FAIL"
+            cx_reason=$(echo "$response" | grep "CX_RESULT:FAIL" | sed 's/.*CX_RESULT:FAIL|\?//' | head -1)
+            echo -e "  ${RED}│ ✗ Test CX: FAIL - $cx_reason${RESET}"
+        else
+            # Pas de résultat clair, on continue l'interaction
+            cx_prompt="L'utilisateur répond: OK, continue ton test.
+
+Maintenant tu DOIS conclure:
+CX_RESULT:PASS ou CX_RESULT:FAIL|raison"
+        fi
+    done
+
+    # Si toujours PENDING après max interactions, considérer comme PASS (bénéfice du doute)
+    if [[ "$cx_result" == "PENDING" ]]; then
+        cx_result="PASS"
+        cx_reason="Max interactions atteint - bénéfice du doute"
+        echo -e "  ${YELLOW}│ Test CX: PASS (par défaut après $CX_MAX_INTERACTIONS interactions)${RESET}"
+    fi
+
+    # Logger le résultat
+    cx_log_entry+="$full_response
+--- RÉSULTAT ---
+Status: $cx_result
+Raison: ${cx_reason:-N/A}
+Interactions: $interaction
+"
+
+    # Écrire dans le log CX
+    mkdir -p "$LOG_DIR"
+    echo "$cx_log_entry" >> "$CX_LOG_FILE"
+
+    # Émettre l'événement
+    emit_event "CX_TEST" "loop=$loop_num" "task=$task_name" "result=$cx_result" "interactions=$interaction"
+
+    # Si FAIL, marquer la tâche comme échouée dans TODO.md
+    if [[ "$cx_result" == "FAIL" ]]; then
+        mark_task_cx_failed "$task_name" "$cx_reason"
+        return 1
+    fi
+
+    return 0
+}
+
+# Marquer une tâche comme échouée au test CX dans TODO.md
+mark_task_cx_failed() {
+    local task_name="$1"
+    local reason="$2"
+
+    if [[ ! -f "$TASK_FILE" ]]; then
+        return
+    fi
+
+    # Chercher la tâche et ajouter le statut CX_FAIL
+    # On cherche la ligne avec [x] et le nom de la tâche
+    local escaped_task=$(echo "$task_name" | sed 's/[\/&]/\\&/g')
+    local fail_marker="[CX_FAIL: $reason]"
+
+    # Ajouter le marqueur à la fin de la ligne de la tâche
+    if grep -q "\[x\].*$escaped_task" "$TASK_FILE" 2>/dev/null; then
+        sed -i.bak "s/\(\[x\].*$escaped_task.*\)/\1 $fail_marker/" "$TASK_FILE"
+        rm -f "$TASK_FILE.bak"
+        log_info "Tâche marquée CX_FAIL: $task_name - $reason"
+        echo -e "  ${RED}│ 📝 Tâche marquée [CX_FAIL] dans $TASK_FILE${RESET}"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# RISK ASSESSMENT - Évaluation du risque des tâches
+# -----------------------------------------------------------------------------
+
+# Initialiser le fichier de review queue si nécessaire
+init_review_queue() {
+    if [[ ! -f "$REVIEW_QUEUE_FILE" ]]; then
+        cat > "$REVIEW_QUEUE_FILE" << 'EOF'
+# Review Queue - Tâches nécessitant une review humaine
+
+> Ce fichier est généré automatiquement par Claude Ultra.
+> Les tâches à haut risque sont ajoutées ici pour review.
+
+## Légende
+- 🔴 HIGH - Review approfondie requise
+- 🟡 MEDIUM - Review standard recommandée
+- ⏳ En attente de review
+- ✅ Reviewée et approuvée
+- ❌ Reviewée et rejetée
+
+---
+
+## En attente de review
+
+EOF
+    fi
+}
+
+# Évaluer le risque d'une tâche
+assess_task_risk() {
+    local task_name="$1"
+    local diff_summary="$2"
+    local files_changed="$3"
+    local loop_num="$4"
+
+    # Skip si désactivé
+    if [[ "$RISK_ENABLED" != "true" ]]; then
+        echo "LOW"
+        return 0
+    fi
+
+    echo -e "${CYAN}📊 Évaluation du risque...${RESET}"
+
+    # Construire le prompt
+    local risk_prompt="${RISK_ASSESSOR_PROMPT}"
+    risk_prompt="${risk_prompt//%TASK%/$task_name}"
+    risk_prompt="${risk_prompt//%DIFF%/$diff_summary}"
+    risk_prompt="${risk_prompt//%FILES%/$files_changed}"
+
+    # Timestamp pour le log
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    # Appel Claude avec timeout court (45s)
+    local response=""
+    response=$(claude_with_timeout 45 "$risk_prompt" 2>/dev/null)
+
+    # Valeurs par défaut
+    local risk_level="MEDIUM"
+    local risk_reason="Évaluation automatique"
+    local review_needed="false"
+    local review_focus=""
+
+    if [ -n "$response" ]; then
+        # Extraire les valeurs de la réponse
+        if echo "$response" | grep -q "RISK_LEVEL:"; then
+            risk_level=$(echo "$response" | grep "RISK_LEVEL:" | sed 's/.*RISK_LEVEL://' | tr -d '[:space:]' | head -1)
+        fi
+        if echo "$response" | grep -q "RISK_REASON:"; then
+            risk_reason=$(echo "$response" | grep "RISK_REASON:" | sed 's/.*RISK_REASON://' | head -1)
+        fi
+        if echo "$response" | grep -q "REVIEW_NEEDED:true"; then
+            review_needed="true"
+        fi
+        if echo "$response" | grep -q "REVIEW_FOCUS:"; then
+            review_focus=$(echo "$response" | grep "REVIEW_FOCUS:" | sed 's/.*REVIEW_FOCUS://' | head -1)
+        fi
+    fi
+
+    # Normaliser le niveau de risque
+    case "$risk_level" in
+        LOW|low) risk_level="LOW" ;;
+        MEDIUM|medium) risk_level="MEDIUM" ;;
+        HIGH|high) risk_level="HIGH" ;;
+        *) risk_level="MEDIUM" ;;
+    esac
+
+    # Affichage selon le niveau
+    case "$risk_level" in
+        LOW)
+            echo -e "  ${GREEN}│ 🟢 Risque: FAIBLE${RESET} - $risk_reason"
+            ;;
+        MEDIUM)
+            echo -e "  ${YELLOW}│ 🟡 Risque: MOYEN${RESET} - $risk_reason"
+            ;;
+        HIGH)
+            echo -e "  ${RED}│ 🔴 Risque: ÉLEVÉ${RESET} - $risk_reason"
+            if [ -n "$review_focus" ]; then
+                echo -e "  ${RED}│ 👁 Focus review:${RESET} $review_focus"
+            fi
+            ;;
+    esac
+
+    # Logger le résultat
+    mkdir -p "$LOG_DIR"
+    cat >> "$RISK_LOG_FILE" << EOF
+================================================================================
+[RISK ASSESSMENT] $timestamp | Loop #$loop_num
+================================================================================
+Task: $task_name
+Files: $files_changed
+Risk Level: $risk_level
+Reason: $risk_reason
+Review Needed: $review_needed
+Review Focus: $review_focus
+--------------------------------------------------------------------------------
+EOF
+
+    # Émettre l'événement
+    emit_event "RISK_ASSESSED" "loop=$loop_num" "task=$task_name" "level=$risk_level" "review=$review_needed"
+
+    # Ajouter à la review queue si nécessaire
+    if [[ "$review_needed" == "true" ]] || [[ "$risk_level" == "HIGH" ]]; then
+        add_to_review_queue "$task_name" "$risk_level" "$risk_reason" "$review_focus" "$files_changed"
+    fi
+
+    # Retourner le niveau pour traitement ultérieur
+    echo "$risk_level"
+}
+
+# Ajouter une tâche à la review queue
+add_to_review_queue() {
+    local task_name="$1"
+    local risk_level="$2"
+    local risk_reason="$3"
+    local review_focus="$4"
+    local files_changed="$5"
+
+    init_review_queue
+
+    local timestamp=$(date '+%Y-%m-%d %H:%M')
+    local icon="🟡"
+    [[ "$risk_level" == "HIGH" ]] && icon="🔴"
+
+    # Ajouter l'entrée à la queue
+    cat >> "$REVIEW_QUEUE_FILE" << EOF
+
+### $icon [$risk_level] $task_name
+- **Date**: $timestamp
+- **Raison**: $risk_reason
+- **Focus**: ${review_focus:-"Review générale"}
+- **Fichiers**: $files_changed
+- **Statut**: ⏳ En attente
+
+EOF
+
+    echo -e "  ${YELLOW}│ 📋 Ajouté à $REVIEW_QUEUE_FILE${RESET}"
+    log_info "Tâche ajoutée à la review queue: $task_name ($risk_level)"
+}
+
+# Vérifier si on doit bloquer pour review (selon le seuil configuré)
+should_pause_for_review() {
+    local risk_level="$1"
+
+    case "$RISK_PAUSE_THRESHOLD" in
+        LOW)
+            # Pause pour tout sauf rien
+            [[ "$risk_level" != "" ]] && return 0
+            ;;
+        MEDIUM)
+            # Pause pour MEDIUM et HIGH
+            [[ "$risk_level" == "MEDIUM" || "$risk_level" == "HIGH" ]] && return 0
+            ;;
+        HIGH)
+            # Pause seulement pour HIGH
+            [[ "$risk_level" == "HIGH" ]] && return 0
+            ;;
+        NONE)
+            # Jamais de pause
+            return 1
+            ;;
+    esac
+
+    return 1
+}
+
+# Vérifier si on peut auto-approve (skip CX test)
+can_auto_approve() {
+    local risk_level="$1"
+
+    case "$RISK_AUTO_APPROVE" in
+        LOW)
+            [[ "$risk_level" == "LOW" ]] && return 0
+            ;;
+        MEDIUM)
+            [[ "$risk_level" == "LOW" || "$risk_level" == "MEDIUM" ]] && return 0
+            ;;
+        HIGH)
+            # Auto-approve tout (pas recommandé)
+            return 0
+            ;;
+        NONE)
+            # Jamais d'auto-approve
+            return 1
+            ;;
+    esac
+
+    return 1
 }
 
 # -----------------------------------------------------------------------------
@@ -983,6 +1418,51 @@ $diff_summary" | head -1 | tr -d '\n')
                         log_success "Commit: $commit_message"
                     fi
                 fi
+            fi
+
+            # Récupérer le diff et les fichiers modifiés pour l'évaluation
+            local task_diff=""
+            local files_changed=""
+            if [ "$has_new_commits" = true ]; then
+                task_diff=$(git diff "$head_before".."$head_after" --stat 2>/dev/null | head -15)
+                files_changed=$(git diff "$head_before".."$head_after" --name-only 2>/dev/null | tr '\n' ', ')
+            else
+                task_diff="$diff_summary"
+                files_changed=$(git diff --cached --name-only 2>/dev/null | tr '\n' ', ')
+            fi
+
+            # 1. Évaluation du risque de la tâche
+            local risk_level="MEDIUM"
+            if [[ "$RISK_ENABLED" == "true" && -n "$current_task_name" ]]; then
+                # Capturer le niveau de risque (dernière ligne de la sortie)
+                risk_level=$(assess_task_risk "$current_task_name" "$task_diff" "$files_changed" "$loop" | tail -1)
+            fi
+
+            # 2. Décider si on doit faire le test CX
+            local skip_cx_test=false
+
+            # Auto-approve si risque faible
+            if can_auto_approve "$risk_level"; then
+                echo -e "  ${GREEN}│ ⚡ Auto-approve (risque $risk_level)${RESET}"
+                skip_cx_test=true
+            fi
+
+            # 3. Customer Experience Test (sauf si auto-approved)
+            if [[ "$skip_cx_test" == "false" && "$CX_ENABLED" == "true" && -n "$current_task_name" ]]; then
+                # Exécuter le test CX (1-2 interactions max)
+                if ! run_cx_test "$current_task_name" "$task_diff" "$loop"; then
+                    # Test CX échoué - la tâche a été marquée FAIL
+                    emit_event "CX_FAILED" "loop=$loop" "task=$current_task_name"
+                fi
+            fi
+
+            # 4. Vérifier si on doit pauser pour review humaine
+            if should_pause_for_review "$risk_level"; then
+                echo -e "  ${RED}│ ⏸ PAUSE - Review humaine requise pour risque $risk_level${RESET}"
+                echo -e "  ${YELLOW}│ Consultez $REVIEW_QUEUE_FILE puis relancez le pipeline${RESET}"
+                emit_event "REVIEW_PAUSE" "loop=$loop" "task=$current_task_name" "risk=$risk_level"
+                [[ "$OUTPUT_MODE" == "events" ]] && echo "paused" > "$STATUS_FILE"
+                break
             fi
 
         else
@@ -2181,6 +2661,39 @@ while [[ $# -gt 0 ]]; do
             MAX_CALLS_PER_HOUR="$2"
             shift 2
             ;;
+        --no-cx)
+            CX_ENABLED="false"
+            shift
+            ;;
+        --cx-interactions)
+            CX_MAX_INTERACTIONS="$2"
+            shift 2
+            ;;
+        --no-risk)
+            RISK_ENABLED="false"
+            shift
+            ;;
+        --risk-pause)
+            # Seuil pour pause: LOW, MEDIUM, HIGH, NONE
+            RISK_PAUSE_THRESHOLD="$2"
+            shift 2
+            ;;
+        --auto-approve)
+            # Seuil pour auto-approve: LOW, MEDIUM, HIGH, NONE
+            RISK_AUTO_APPROVE="$2"
+            shift 2
+            ;;
+        --autonomous)
+            # Mode full autonome: pas de pause, auto-approve medium
+            RISK_PAUSE_THRESHOLD="NONE"
+            RISK_AUTO_APPROVE="MEDIUM"
+            shift
+            ;;
+        --require-review)
+            # Force la pause pour les tâches HIGH
+            RISK_PAUSE_THRESHOLD="HIGH"
+            shift
+            ;;
         --help|-h)
             echo "Usage: $0 [options]"
             echo ""
@@ -2199,6 +2712,29 @@ while [[ $# -gt 0 ]]; do
             echo "  --max-calls N          Limite d'appels par heure (défaut: 50)"
             echo "  --output MODE, -o      Mode sortie: verbose (défaut), events, quiet"
             echo "  --help, -h             Affiche cette aide"
+            echo ""
+            echo "Customer Experience Tester:"
+            echo "  --no-cx                Désactive le test CX après chaque tâche"
+            echo "  --cx-interactions N    Nombre max d'interactions CX (défaut: 2)"
+            echo "  Le CX Tester simule un utilisateur lambda pour valider l'UX."
+            echo "  Si le test échoue, la tâche est marquée [CX_FAIL] dans TODO.md."
+            echo "  Logs dans: logs/cx-tests-YYYYMMDD.log"
+            echo ""
+            echo "Risk Assessment (catégorisation des stories):"
+            echo "  --no-risk              Désactive l'évaluation du risque"
+            echo "  --risk-pause LEVEL     Pause pour review si risque >= LEVEL"
+            echo "                         LEVEL: LOW, MEDIUM, HIGH, NONE (défaut)"
+            echo "  --auto-approve LEVEL   Auto-approve (skip CX) si risque <= LEVEL"
+            echo "                         LEVEL: LOW (défaut), MEDIUM, HIGH, NONE"
+            echo "  --require-review       Force la pause pour HIGH (--risk-pause HIGH)"
+            echo ""
+            echo "  Niveaux de risque:"
+            echo "    LOW    - Modifications mineures, patterns établis"
+            echo "    MEDIUM - Nouvelles fonctionnalités simples"
+            echo "    HIGH   - Nouvelles architectures, sécurité, DB migrations"
+            echo ""
+            echo "  Les tâches HIGH sont ajoutées à @review-queue.md"
+            echo "  Logs dans: logs/risk-assessment-YYYYMMDD.log"
             echo ""
             echo "Intégration Claude Code (mode events):"
             echo "  --output events        Émet des événements JSON pour le skill /ultra"
