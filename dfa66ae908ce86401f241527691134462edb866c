@@ -1,0 +1,38 @@
+TODO.md
+  de0913c8a1bd19c5 4
+docs/CHANGELOG.md
+  de0913c8a1bd19c5 1-67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.0.34",
+  "base_commit_sha": "dfa66ae908ce86401f241527691134462edb866c",
+  "prompts": {
+    "7b1b5c2219111acb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d29fe455-b684-41a0-a95a-dc448e64bfe6",
+        "model": "claude-opus-4-5-20251101"
+      },
+      "human_author": "Sovattha Sok <github@soks.fr>",
+      "messages": [],
+      "total_additions": 9,
+      "total_deletions": 3,
+      "accepted_lines": 9,
+      "overriden_lines": 0
+    },
+    "de0913c8a1bd19c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2abf100f-1dbd-4f8a-a35e-25f465a7180c",
+        "model": "claude-opus-4-5-20251101"
+      },
+      "human_author": "Sovattha Sok <github@soks.fr>",
+      "messages": [],
+      "total_additions": 68,
+      "total_deletions": 1,
+      "accepted_lines": 68,
+      "overriden_lines": 0
+    }
+  }
+}
