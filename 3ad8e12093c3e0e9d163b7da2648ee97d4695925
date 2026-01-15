@@ -1,0 +1,39 @@
+TODO.md
+  6ab67a3cec1816b9 3
+claude-ultra.sh
+  6ab67a3cec1816b9 13
+  7b1b5c2219111acb 62-79,750-825,880-1217,1423-1467,2664-2696,2716-2738
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.0.34",
+  "base_commit_sha": "3ad8e12093c3e0e9d163b7da2648ee97d4695925",
+  "prompts": {
+    "6ab67a3cec1816b9": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b958a18e-ed29-4485-a59a-6e688dfe361a",
+        "model": "claude-opus-4-5-20251101"
+      },
+      "human_author": "Sovattha Sok <github@soks.fr>",
+      "messages": [],
+      "total_additions": 2,
+      "total_deletions": 1,
+      "accepted_lines": 2,
+      "overriden_lines": 0
+    },
+    "7b1b5c2219111acb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "d29fe455-b684-41a0-a95a-dc448e64bfe6",
+        "model": "claude-opus-4-5-20251101"
+      },
+      "human_author": "Sovattha Sok <github@soks.fr>",
+      "messages": [],
+      "total_additions": 551,
+      "total_deletions": 15,
+      "accepted_lines": 535,
+      "overriden_lines": 0
+    }
+  }
+}
