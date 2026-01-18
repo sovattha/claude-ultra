@@ -62,6 +62,13 @@ STATUS_FILE="@ultra.status"
 PID_FILE="@ultra.pid"
 
 # -----------------------------------------------------------------------------
+# BMAD INTEGRATION (Sprint Status / User Stories)
+# -----------------------------------------------------------------------------
+BMAD_STATUS_FILE="_bmad-output/implementation-artifacts/sprint-status.yaml"
+BMAD_STORIES_DIR="_bmad-output/implementation-artifacts/stories"
+BMAD_MODE=false
+
+# -----------------------------------------------------------------------------
 # CUSTOMER EXPERIENCE TESTER
 # -----------------------------------------------------------------------------
 CX_ENABLED="${CX_ENABLED:-true}"
@@ -246,6 +253,108 @@ EOF
     echo "===============================================================================" >> "$LOG_FILE"
 
     log_info "Fichiers de contrôle vérifiés"
+
+    # Détecter le mode BMAD
+    if [[ -f "$BMAD_STATUS_FILE" ]]; then
+        BMAD_MODE=true
+        log_info "Mode BMAD détecté (sprint-status.yaml trouvé)"
+    fi
+}
+
+# -----------------------------------------------------------------------------
+# BMAD FUNCTIONS - Gestion des User Stories
+# -----------------------------------------------------------------------------
+
+# Compte le nombre de stories BMAD en backlog ou ready-for-dev
+get_bmad_pending_count() {
+    if [[ ! -f "$BMAD_STATUS_FILE" ]]; then
+        echo "0"
+        return
+    fi
+
+    # Compte les lignes qui matchent: "  X-Y-story-name: backlog" ou "ready-for-dev"
+    local count
+    count=$(grep -cE "^\s+[0-9]+-[0-9]+-.*:\s*(backlog|ready-for-dev)" "$BMAD_STATUS_FILE" 2>/dev/null || echo "0")
+    echo "$count"
+}
+
+# Retourne l'ID de la prochaine story BMAD (ex: "3-2")
+get_next_bmad_story_id() {
+    if [[ ! -f "$BMAD_STATUS_FILE" ]]; then
+        return 1
+    fi
+
+    # Trouve la première story en backlog ou ready-for-dev
+    local next_line
+    next_line=$(grep -E "^\s+[0-9]+-[0-9]+-.*:\s*(backlog|ready-for-dev)" "$BMAD_STATUS_FILE" | head -1)
+
+    if [[ -z "$next_line" ]]; then
+        return 1
+    fi
+
+    # Extrait l'ID (ex: "3-2" de "  3-2-email-content-reader: backlog")
+    # Utilise awk pour une meilleure compatibilité macOS/Linux
+    echo "$next_line" | awk -F'[-:]' '{gsub(/^[[:space:]]+/, "", $1); print $1"-"$2}'
+}
+
+# Retourne le nom complet de la story (ex: "3-2-email-content-reader")
+get_next_bmad_story_name() {
+    if [[ ! -f "$BMAD_STATUS_FILE" ]]; then
+        return 1
+    fi
+
+    local next_line
+    next_line=$(grep -E "^\s+[0-9]+-[0-9]+-.*:\s*(backlog|ready-for-dev)" "$BMAD_STATUS_FILE" | head -1)
+
+    if [[ -z "$next_line" ]]; then
+        return 1
+    fi
+
+    # Extrait le nom complet (ex: "3-2-email-content-reader")
+    # Utilise awk pour une meilleure compatibilité macOS/Linux
+    echo "$next_line" | awk -F':' '{gsub(/^[[:space:]]+/, "", $1); print $1}'
+}
+
+# Compte le total des tâches pendantes (TODO.md + BMAD)
+get_total_pending_tasks() {
+    local todo_count=0
+    local bmad_count=0
+
+    # Compter les tâches TODO.md
+    if [[ -f "$TASK_FILE" ]]; then
+        todo_count=$(grep -c "^\s*- \[ \]" "$TASK_FILE" 2>/dev/null || echo "0")
+    fi
+
+    # Compter les stories BMAD si TODO.md est vide
+    if [[ "$todo_count" -eq 0 && "$BMAD_MODE" == "true" ]]; then
+        bmad_count=$(get_bmad_pending_count)
+    fi
+
+    echo $((todo_count + bmad_count))
+}
+
+# Vérifie si on doit utiliser BMAD (TODO.md vide et stories disponibles)
+should_use_bmad() {
+    if [[ "$BMAD_MODE" != "true" ]]; then
+        return 1
+    fi
+
+    # Vérifier si TODO.md a des tâches pendantes
+    local todo_count=0
+    if [[ -f "$TASK_FILE" ]]; then
+        todo_count=$(grep -c "^\s*- \[ \]" "$TASK_FILE" 2>/dev/null || echo "0")
+    fi
+
+    # Si TODO.md vide, vérifier BMAD
+    if [[ "$todo_count" -eq 0 ]]; then
+        local bmad_count
+        bmad_count=$(get_bmad_pending_count)
+        if [[ "$bmad_count" -gt 0 ]]; then
+            return 0  # Utiliser BMAD
+        fi
+    fi
+
+    return 1  # Ne pas utiliser BMAD
 }
 
 # -----------------------------------------------------------------------------
@@ -368,8 +477,9 @@ write_progress() {
     local task="${3:-}"
     local status="${4:-running}"
 
-    local pending_tasks=0
-    [[ -f "$TASK_FILE" ]] && pending_tasks=$(grep -c "^\s*- \[ \]" "$TASK_FILE" 2>/dev/null || echo "0")
+    # Utilise la fonction qui compte TODO.md + BMAD si vide
+    local pending_tasks
+    pending_tasks=$(get_total_pending_tasks)
 
     local elapsed=0
     [[ -n "${START_TIME:-}" ]] && elapsed=$(($(date +%s) - START_TIME))
@@ -449,16 +559,14 @@ check_rate_limit() {
 # DÉTECTION FIN DE TÂCHE (Style Ralph)
 # -----------------------------------------------------------------------------
 check_task_completion() {
-    # Vérifie si toutes les tâches sont terminées dans TODO.md
-    if [ -f "$TASK_FILE" ]; then
-        local pending_tasks
-        pending_tasks=$(grep -c "^\s*- \[ \]" "$TASK_FILE" 2>/dev/null || echo "0")
-        
-        if [ "$pending_tasks" -eq 0 ]; then
-            echo -e "${GREEN}🎉 Toutes les tâches sont terminées !${RESET}"
-            log_success "Toutes les tâches complétées"
-            return 0
-        fi
+    # Vérifie si toutes les tâches sont terminées (TODO.md + BMAD)
+    local total_pending
+    total_pending=$(get_total_pending_tasks)
+
+    if [ "$total_pending" -eq 0 ]; then
+        echo -e "${GREEN}🎉 Toutes les tâches sont terminées !${RESET}"
+        log_success "Toutes les tâches complétées (TODO.md + BMAD)"
+        return 0
     fi
     return 1
 }
@@ -475,15 +583,15 @@ detect_no_changes() {
         log_info "Pas de changements détectés ($CONSECUTIVE_NO_CHANGES/$MAX_CONSECUTIVE_NO_CHANGES)"
 
         if [ $CONSECUTIVE_NO_CHANGES -ge $MAX_CONSECUTIVE_NO_CHANGES ]; then
-            # Vérifier s'il reste des tâches pendantes avant d'arrêter
-            local pending_tasks=0
-            if [ -f "$TASK_FILE" ]; then
-                pending_tasks=$(grep -c "^[[:space:]]*- \[ \]" "$TASK_FILE" 2>/dev/null || echo "0")
-            fi
+            # Vérifier s'il reste des tâches pendantes avant d'arrêter (TODO.md + BMAD)
+            local pending_tasks
+            pending_tasks=$(get_total_pending_tasks)
 
             if [ "$pending_tasks" -gt 0 ]; then
-                log_info "Pas de changements mais $pending_tasks tâche(s) restante(s) - on continue"
-                echo -e "${YELLOW}⚠️  $MAX_CONSECUTIVE_NO_CHANGES cycles sans changements mais $pending_tasks tâche(s) restante(s)${RESET}"
+                local source="TODO.md"
+                should_use_bmad && source="BMAD"
+                log_info "Pas de changements mais $pending_tasks tâche(s) restante(s) ($source) - on continue"
+                echo -e "${YELLOW}⚠️  $MAX_CONSECUTIVE_NO_CHANGES cycles sans changements mais $pending_tasks tâche(s) restante(s) ($source)${RESET}"
                 # Reset le compteur pour donner une autre chance
                 CONSECUTIVE_NO_CHANGES=0
                 return 1
@@ -832,6 +940,8 @@ build_fast_prompt() {
     local fix_plan=""
     local agent_config=""
     local current_task=""
+    local tasks=""
+    local bmad_instruction=""
 
     # Charger le contexte local
     if [ -f "$CONTEXT_FILE" ]; then
@@ -861,12 +971,55 @@ TÂCHE EN COURS (continue celle-ci!):
 $(cat "$CURRENT_TASK_FILE")"
     fi
 
-    # Liste des tâches
-    local tasks=""
-    if [ -f "$TASK_FILE" ]; then
-        tasks="
+    # Vérifier si on doit utiliser BMAD (TODO.md vide mais stories disponibles)
+    if should_use_bmad; then
+        local story_id
+        local story_name
+        story_id=$(get_next_bmad_story_id)
+        story_name=$(get_next_bmad_story_name)
+
+        # Afficher dans les logs
+        log_info "Mode BMAD: prochaine story $story_id ($story_name)"
+        echo -e "${CYAN}📋 Mode BMAD: Story $story_id${RESET}" >&2
+
+        # Charger le contenu de la story si le fichier existe
+        local story_file="$BMAD_STORIES_DIR/${story_name}.md"
+        local story_content=""
+        if [[ -f "$story_file" ]]; then
+            story_content="
+STORY FILE CONTENT:
+$(cat "$story_file")"
+        fi
+
+        bmad_instruction="
+═══════════════════════════════════════════════════════════════════
+📋 MODE BMAD ACTIVÉ - Implémentation User Story
+═══════════════════════════════════════════════════════════════════
+
+INSTRUCTION PRINCIPALE:
+Exécute la commande /dev-story $story_id pour implémenter cette User Story.
+
+STORY À IMPLÉMENTER: $story_name
+STORY ID: $story_id
+${story_content}
+
+PROCESSUS:
+1. Utilise /dev-story $story_id pour charger le workflow BMAD
+2. Suis les acceptance criteria de la story
+3. Implémente le code nécessaire
+4. Écris les tests
+5. Commit avec un message approprié
+6. Met à jour le sprint-status.yaml quand terminé
+
+IMPORTANT: Utilise le skill /dev-story, ne fais PAS l'implémentation manuellement !
+"
+    else
+        # Mode classique: Liste des tâches TODO.md
+        if [ -f "$TASK_FILE" ]; then
+            tasks="
 TÂCHES DISPONIBLES ($TASK_FILE):
 $(cat "$TASK_FILE")"
+        fi
     fi
 
     echo "${FAST_PROMPT}
@@ -875,6 +1028,7 @@ ${fix_plan}
 ${agent_config}
 ${current_task}
 ${tasks}
+${bmad_instruction}
 
 AGIS MAINTENANT. Choisis une tâche et implémente-la complètement."
 }
@@ -1229,10 +1383,14 @@ run_fast_mode() {
         echo "running" > "$STATUS_FILE"
         : > "$EVENTS_FILE"
 
-        local pending_tasks=0
-        [[ -f "$TASK_FILE" ]] && pending_tasks=$(grep -c "^\s*- \[ \]" "$TASK_FILE" 2>/dev/null || echo "0")
+        # Utilise la fonction qui compte TODO.md + BMAD
+        local pending_tasks
+        pending_tasks=$(get_total_pending_tasks)
 
-        emit_event "PIPELINE_START" "mode=fast" "max_tasks=$MAX_TASKS" "pending_tasks=$pending_tasks"
+        local mode_info="fast"
+        should_use_bmad && mode_info="fast+bmad"
+
+        emit_event "PIPELINE_START" "mode=$mode_info" "max_tasks=$MAX_TASKS" "pending_tasks=$pending_tasks"
     fi
 
     echo -e "${BOLD}${CYAN}"
