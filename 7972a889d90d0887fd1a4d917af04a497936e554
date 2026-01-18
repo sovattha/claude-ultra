@@ -1,0 +1,25 @@
+docs/CONTRIBUTING.md
+  54b3956de9b197c5 1-151
+TODO.md
+  54b3956de9b197c5 5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.0.34",
+  "base_commit_sha": "7972a889d90d0887fd1a4d917af04a497936e554",
+  "prompts": {
+    "54b3956de9b197c5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fdbb6694-6362-46f5-a4d7-cb6fc1414a71",
+        "model": "claude-opus-4-5-20251101"
+      },
+      "human_author": "Sovattha Sok <github@soks.fr>",
+      "messages": [],
+      "total_additions": 152,
+      "total_deletions": 1,
+      "accepted_lines": 152,
+      "overriden_lines": 0
+    }
+  }
+}
